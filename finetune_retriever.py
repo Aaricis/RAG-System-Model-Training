@@ -2,8 +2,9 @@ import argparse
 import json
 import os
 from datetime import datetime
+import logging
 
-from sentence_transformers import InputExample, losses, SentenceTransformer
+from sentence_transformers import InputExample, losses, SentenceTransformer, LoggingHandler
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from torch.utils.data import Dataset, DataLoader
 
@@ -16,6 +17,7 @@ parser.add_argument("--model_name", type=str, default="intfloat/multilingual-e5-
 parser.add_argument("--model_save_path", type=str, default="./output/retriever")
 parser.add_argument("--num_epochs", type=int, default=1)
 parser.add_argument("--batch_size", type=int, default=32)
+parser.add_argument("--evaluation_steps", type=int, default=500)
 args = parser.parse_args()
 
 train_data_path = args.train_data_path
@@ -28,6 +30,16 @@ model_save_path = args.model_save_path + f'train_bi-encoder-mnrl-{model_name.rep
 os.makedirs(model_save_path, exist_ok=True)
 
 batch_size = args.batch_size
+
+# 设定日志
+logging.basicConfig(
+    format="%(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    handlers=[LoggingHandler()],
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
 
 # 1. 数据准备
@@ -70,6 +82,8 @@ with open(train_data_path, "r", encoding="utf-8") as f:
                     InputExample(texts=[format_query(query), format_passage(p), format_passage(n)])
                 )
                 # (query, positive_passage, negative_passage)
+
+logger.info(f"成功建立 {len(train_samples)} 个MNR训练样本。")
 
 # 构造测试数据
 # 查询 / anchor，relevant_docs（相关性标注），corpus（候选文档库）
@@ -125,6 +139,8 @@ for qid in queries.keys():
     for pid, _ in qrels[qid].items():
         corpus[pid] = texts[pid]
 
+logger.info(f"载入 {len(corpus)} 个段落，{len(queries)} 个查询，{len(relevant_docs)} 个相关性映射。")
+
 
 # 数据加载器
 class SentenceDataset(Dataset):
@@ -162,12 +178,17 @@ loss_fn = losses.MultipleNegativesRankingLoss(model)
 
 # 5. 训练
 
-warmup_steps =(len(train_dataloader) // batch_size) * 0.1 #
+warmup_steps = (len(train_dataloader) // batch_size) * 0.1  # 总训练步数的10%
 
+logger.info("开始模型训练！")
 model.fit(
     train_objectives=[(train_dataloader, loss_fn)],
     evaluator=ir_evaluator,
     epochs=args.num_epochs,
     warmup_steps=warmup_steps,
-    output_path=model_save_path
+    evaluation_steps=args.evaluation_steps,
+    output_path=model_save_path,
+    save_best_model=True,  # 儲存最佳模型
+    use_amp=True,  # Automatic Mixed Precision (AMP)
 )
+logger.info("训练完成！")
