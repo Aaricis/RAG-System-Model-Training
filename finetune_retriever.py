@@ -1,12 +1,17 @@
 import argparse
 import json
+import logging
 import os
 from datetime import datetime
-import logging
 
-from sentence_transformers import InputExample, losses, SentenceTransformer, LoggingHandler
+from datasets import Dataset
+from sentence_transformers import InputExample, LoggingHandler
+from sentence_transformers import SentenceTransformer
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from torch.utils.data import Dataset, DataLoader
+from sentence_transformers.losses import MultipleNegativesRankingLoss
+from sentence_transformers.trainer import SentenceTransformerTrainer
+from sentence_transformers.training_args import SentenceTransformerTrainingArguments
+from torch.utils.data import Dataset
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--train_data_path", type=str, default="./data/train.txt")
@@ -26,7 +31,8 @@ qrels_path = args.qrels_path
 corpus_data_path = args.corpus_data_path
 model_name = args.model_name
 
-model_save_path = args.model_save_path + f'train_bi-encoder-mnrl-{model_name.replace("/", "-")}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+model_save_path = os.path.join(args.model_save_path,
+                               f'train_bi-encoder-mnrl-{model_name.replace("/", "-")}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
 os.makedirs(model_save_path, exist_ok=True)
 
 batch_size = args.batch_size
@@ -41,8 +47,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
-
 # 1. 数据准备
+
+logger.info("构建训练数据。")
+
 
 def format_query(q):
     return f"query: {q}"
@@ -85,8 +93,28 @@ with open(train_data_path, "r", encoding="utf-8") as f:
 
 logger.info(f"成功建立 {len(train_samples)} 个MNR训练样本。")
 
+
+def build_train_dataset(samples):
+    data = {
+        "anchor": [],
+        "positive": [],
+        "negative": []
+    }
+
+    for ex in samples:
+        data["anchor"].append(ex.texts[0])
+        data["positive"].append(ex.texts[1])
+        data["negative"].append(ex.texts[2])
+
+    return Dataset.from_dict(data)
+
+
+train_dataset = build_train_dataset(train_samples)
+
 # 构造测试数据
 # 查询 / anchor，relevant_docs（相关性标注），corpus（候选文档库）
+
+logger.info("构建测试数据！")
 queries, relevant_docs, corpus = {}, {}, {}
 """
 queries = {
@@ -139,23 +167,7 @@ for qid in queries.keys():
     for pid, _ in qrels[qid].items():
         corpus[pid] = texts[pid]
 
-logger.info(f"载入 {len(corpus)} 个段落，{len(queries)} 个查询，{len(relevant_docs)} 个相关性映射。")
-
-
-# 数据加载器
-class SentenceDataset(Dataset):
-    def __init__(self, samples: list[InputExample]):
-        self.samples = samples
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-train_dataset = SentenceDataset(train_samples)
-train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)
+logger.info(f"载入{len(corpus)}个段落，{len(queries)}个查询，{len(relevant_docs)}个相关性映射。")
 
 # 2. 评估器
 
@@ -174,21 +186,45 @@ ir_evaluator = InformationRetrievalEvaluator(
 model = SentenceTransformer(model_name)
 
 # 4. 损失函数
-loss_fn = losses.MultipleNegativesRankingLoss(model)
+loss = MultipleNegativesRankingLoss(model)
 
 # 5. 训练
 
-warmup_steps = (len(train_dataloader) // batch_size) * 0.1  # 总训练步数的10%
+training_args = SentenceTransformerTrainingArguments(
+    output_dir=model_save_path,
 
-logger.info("开始模型训练！")
-model.fit(
-    train_objectives=[(train_dataloader, loss_fn)],
-    evaluator=ir_evaluator,
-    epochs=args.num_epochs,
-    warmup_steps=warmup_steps,
-    evaluation_steps=args.evaluation_steps,
-    output_path=model_save_path,
-    save_best_model=True,  # 儲存最佳模型
-    use_amp=True,  # Automatic Mixed Precision (AMP)
+    num_train_epochs=args.num_epochs,
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=16,
+
+    eval_strategy="steps",
+    eval_steps=args.evaluation_steps,
+    save_strategy="steps",
+    save_steps=args.evaluation_steps,
+    save_total_limit=2,
+
+    logging_steps=50,
+    report_to=["tensorboard"],  # ✅ 自动生成 runs/
+
+    fp16=True,  # 等价 use_amp=True
+    warmup_ratio=0.1,  # 等价 warmup_steps=10%
+    learning_rate=2e-5,
+
+    load_best_model_at_end=True,
+    metric_for_best_model="mrr@10",
+    greater_is_better=True,
+
+    remove_unused_columns=False,
 )
+
+trainer = SentenceTransformerTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    evaluator=ir_evaluator,
+    loss=loss,
+)
+
+logger.info("开始使用 SentenceTransformerTrainer 训练！")
+trainer.train()
 logger.info("训练完成！")
