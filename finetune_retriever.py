@@ -11,7 +11,6 @@ from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import MultipleNegativesRankingLoss
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import SentenceTransformerTrainingArguments
-from torch.utils.data import Dataset
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--train_data_path", type=str, default="./data/train.txt")
@@ -195,23 +194,22 @@ training_args = SentenceTransformerTrainingArguments(
 
     num_train_epochs=args.num_epochs,
     per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=16,
 
     eval_strategy="steps",
     eval_steps=args.evaluation_steps,
+
     save_strategy="steps",
     save_steps=args.evaluation_steps,
     save_total_limit=2,
 
     logging_steps=50,
-    report_to=["tensorboard"],  # ✅ 自动生成 runs/
+    report_to=["tensorboard"],
 
-    fp16=True,  # 等价 use_amp=True
-    warmup_ratio=0.1,  # 等价 warmup_steps=10%
-    learning_rate=2e-5,
+    fp16=True,
+    warmup_ratio=0.1,
 
     load_best_model_at_end=True,
-    metric_for_best_model="mrr@10",
+    metric_for_best_model="eval_test_recall_cosine_mrr@10",  # ✅ 修正
     greater_is_better=True,
 
     remove_unused_columns=False,
