@@ -51,21 +51,9 @@ logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 logger.info("构建训练数据。")
 
 
-def format_query(q):
-    return f"query: {q}"
-
-
-def format_passage(passage):
-    return f"passage: {passage}"
-
-
 # 构造训练数据
 
-# anchor：查询/基准句（如用户的搜索问题）
-# positive：与锚点语义相关的句子（如正确答案）
-# negative：与锚点语义不相关的句子（如干扰项）
-
-train_samples = []
+queries, passages = [], []
 with open(train_data_path, "r", encoding="utf-8") as f:
     for line in f:
         if not line.strip():
@@ -74,41 +62,19 @@ with open(train_data_path, "r", encoding="utf-8") as f:
         query = obj.get("rewrite")  # 锚点
         evidences = obj.get("evidences")
         retrieval_labels = obj.get("retrieval_labels")
-        pos, neg = [], []  # 正例，负例
+
+        queries.append(query)
         for evidence, label in zip(evidences, retrieval_labels):
             if label == 1:
-                pos.append(evidence)
-            else:
-                neg.append(evidence)
-
-        # 三元组（锚点-正例-负例）
-        for p in pos:
-            for n in neg:
-                # 正确格式：查询和文档都必须加前缀
-                train_samples.append(
-                    InputExample(texts=[format_query(query), format_passage(p), format_passage(n)])
-                )
-                # (query, positive_passage, negative_passage)
-
-logger.info(f"成功建立 {len(train_samples)} 个MNR训练样本。")
+                passages.append(evidence)
 
 
-def build_train_dataset(samples):
-    data = {
-        "anchor": [],
-        "positive": [],
-        "negative": []
-    }
+train_dataset =  Dataset.from_dict({
+    "anchor":   ["query: " + q for q in queries],
+    "positive": ["passage: " + p for p in passages],
+})
 
-    for ex in samples:
-        data["anchor"].append(ex.texts[0])
-        data["positive"].append(ex.texts[1])
-        data["negative"].append(ex.texts[2])
-
-    return Dataset.from_dict(data)
-
-
-train_dataset = build_train_dataset(train_samples)
+logger.info(f"成功建立 {len(train_dataset)} 个MNR训练样本。")
 
 # 构造测试数据
 # 查询 / anchor，relevant_docs（相关性标注），corpus（候选文档库）
