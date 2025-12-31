@@ -2,18 +2,16 @@
 # 0. imports（安全）
 # =========================
 import argparse
+import gc
 import json
 import os
-import gc
 import sqlite3
 import time
 
-import numpy as np
 import faiss
 import torch
-
-from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
