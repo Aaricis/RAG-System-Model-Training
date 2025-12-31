@@ -22,6 +22,7 @@ parser.add_argument("--model_save_path", type=str, default="./output/retriever")
 parser.add_argument("--num_epochs", type=int, default=1)
 parser.add_argument("--batch_size", type=int, default=32)
 parser.add_argument("--evaluation_steps", type=int, default=500)
+parser.add_argument("--max_seq_length", type=int, default=512)
 args = parser.parse_args()
 
 train_data_path = args.train_data_path
@@ -149,6 +150,7 @@ ir_evaluator = InformationRetrievalEvaluator(
 
 # 3. 模型
 model = SentenceTransformer(model_name)
+model.max_seq_length = args.max_seq_length
 
 # 4. 损失函数
 loss = MultipleNegativesRankingLoss(model)
