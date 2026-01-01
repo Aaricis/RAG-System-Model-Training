@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 
 from datasets import Dataset
-from sentence_transformers import InputExample, LoggingHandler
+from sentence_transformers import LoggingHandler
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import MultipleNegativesRankingLoss
