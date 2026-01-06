@@ -202,6 +202,7 @@ logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 # --- Configuration Constants ---
 MAX_LENGTH = 512  # Max length for multilingual-e5-small
 
+
 def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict], Dict]:
     """
     Loads data from a file. Handles JSONL (default) or a single large JSON object (e.g., qrels).
@@ -231,9 +232,10 @@ def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict
                     data.append(json.loads(line))
                 except json.JSONDecodeError as e:
                     print(
-                        f"Skipping malformed JSON line in {file_path}: Line {i+1}. Error: {e}", file=sys.stderr)
+                        f"Skipping malformed JSON line in {file_path}: Line {i + 1}. Error: {e}", file=sys.stderr)
 
         return data
+
 
 def prepare_training_examples(args, model_name: str):
     """
@@ -284,8 +286,10 @@ def prepare_training_examples(args, model_name: str):
         pos_passage_text = f"passage: {positive_passage_text_raw}"
 
         # --- Pre-validate query and positive passage ---
-        query_token_len = len(tokenizer.encode(query_text, add_special_tokens=True, truncation=True, max_length=MAX_LENGTH))
-        pos_token_len = len(tokenizer.encode(pos_passage_text, add_special_tokens=True, truncation=True, max_length=MAX_LENGTH))
+        query_token_len = len(
+            tokenizer.encode(query_text, add_special_tokens=True, truncation=True, max_length=MAX_LENGTH))
+        pos_token_len = len(
+            tokenizer.encode(pos_passage_text, add_special_tokens=True, truncation=True, max_length=MAX_LENGTH))
 
         if not (query_token_len > 2 and pos_token_len > 2):
             # Skip if query or positive are invalid
@@ -295,8 +299,8 @@ def prepare_training_examples(args, model_name: str):
         queries.append(query_text)
         passages.append(pos_passage_text)
 
-    train_dataset =  Dataset.from_dict({
-        "anchor":   queries,
+    train_dataset = Dataset.from_dict({
+        "anchor": queries,
         "positive": passages,
     })
 
@@ -312,6 +316,43 @@ def prepare_evaluator(args):
     """
     logging.info("Loading data for evaluator...")
 
+    # 1. Load Corpus (passages)
+    corpus_data = load_data(args.corpus_file, is_single_object=False)
+    corpus = {}
+    for item in corpus_data:
+        text = item.get('text', '').strip()
+        pid = item.get('id')
+        if pid and text:
+            corpus[pid] = f"passage: {text}"  # Apply E5 prefix
+
+    # 2. Load Test Queries
+    test_data = load_data(args.test_file, is_single_object=False)
+    queries = {}
+    for item in test_data:
+        qid = item.get('qid')
+        query_text = item.get('rewrite', '').strip()
+        if qid and query_text:
+            queries[qid] = f"query: {query_text}"  # Apply E5 prefix
+
+    # 3. Load Qrels (relevant docs)
+    qrels_data = load_data(args.qrels_file, is_single_object=True)
+    relevant_docs = {}
+    for qid, pids_map in qrels_data.items():
+        if qid in queries:
+            relevant_docs[qid] = set(pids_map.keys())
+
+    logging.info(f"Evaluator: Loaded {len(queries)} queries, {len(corpus)} passages, {len(relevant_docs)} qrels.")
+
+    return InformationRetrievalEvaluator(
+        queries,
+        corpus,
+        relevant_docs,
+        mrr_at_k=[10],
+        precision_recall_at_k=[10],
+        accuracy_at_k=[10],
+        name="test_eval",
+        batch_size=args.eval_batch_size,
+    )
 
 
 def fine_tune_e5_small(args):
@@ -326,7 +367,52 @@ def fine_tune_e5_small(args):
     train_loss = MultipleNegativesRankingLoss(model)
 
     # 4. Prepare the Evaluator
+    evaluator = prepare_evaluator(args)
 
+    # 5. Train arguments
+
+    output_dir = os.path.join(args.output_dir,
+                              f'train_bi-encoder-mnrl-{args.model_name_or_path.replace("/", "-")}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+    os.makedirs(output_dir, exist_ok=True)
+
+    training_args = SentenceTransformerTrainingArguments(
+        output_dir=output_dir,
+
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
+
+        save_strategy="steps",
+        save_steps=args.eval_steps,
+        save_total_limit=2,
+
+        logging_steps=50,
+        report_to=["tensorboard"],
+
+        fp16=True,
+        warmup_ratio=0.1,
+
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_test_eval_cosine_mrr@10",  # ✅ 修正
+        greater_is_better=True,
+
+        remove_unused_columns=False,
+    )
+
+    # 6.Train the Model
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_examples,
+        evaluator=evaluator,
+        loss=train_loss,
+    )
+
+    logger.info("\nStarting fine-tuning...")
+    trainer.train()
+    logger.info(f"\nFine-tuning complete. Best model saved to {output_dir}")
 
 
 if __name__ == "__main__":
@@ -336,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name_or_path", type=str, default="intfloat/multilingual-e5-small")
 
     # Data paths
-    parser.add_argument("--output_dir", type=str, default="./models/retriever",
+    parser.add_argument("--output_dir", type=str, default="./output/retriever",
                         help="Directory to save the trained model.")
     parser.add_argument("--train_file", type=str, default="./data/train.txt",
                         help="Path to the train.txt JSONL file (must contain evidences/retrieval_labels).")
@@ -358,8 +444,12 @@ if __name__ == "__main__":
                         default=1e-5, help="The initial learning rate.")
     parser.add_argument("--use_fp16", action="store_true",
                         help="Whether to use 16-bit precision (mixed precision).")
+    parser.add_argument("--eval_steps", type=int,
+                        default=100, help="Evaluation steps for evaluator")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
+
+    fine_tune_e5_small(args)
