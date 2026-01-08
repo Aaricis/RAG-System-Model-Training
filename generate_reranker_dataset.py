@@ -1,12 +1,13 @@
 import argparse
-import os
-import logging
-import sys
 import json
-from typing import Union, List, Dict
-from sentence_transformers import SentenceTransformer
-import faiss
+import logging
+import os
 import sqlite3
+import sys
+from typing import Union, List, Dict
+
+import faiss
+from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 # --- Configuration ---
@@ -36,6 +37,7 @@ def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict
                     print(f"Skipping malformed JSON line {file_path}: Line {i + 1}", file=sys.stderr)
         return data
 
+
 def create_hard_negatives(args):
     logging.info("Loading fine-tuned retriever model...")
     retriever = SentenceTransformer(args.retriever_model_path, device="cuda")
@@ -55,8 +57,8 @@ def create_hard_negatives(args):
     train_queries_data = load_data(args.train_file, is_single_object=False)
 
     # Store queries and their true positive IDs
-    queries = {} # qid -> query_text
-    qid_to_pos_pids = {} # qid -> set(pos_pid_1, pos_pid_2, ...)
+    queries = {}  # qid -> query_text
+    qid_to_pos_pids = {}  # qid -> set(pos_pid_1, pos_pid_2, ...)
 
     for item in train_queries_data:
         qid = item.get("qid")
@@ -80,8 +82,8 @@ def create_hard_negatives(args):
     new_training_examples = []
 
     for i in tqdm(range(0, len(query_list), args.batch_size), desc="Mining hard negatives"):
-        batch_queries = query_list[i : i + args.batch_size]
-        batch_qids = qid_list[i : i + args.batch_size]
+        batch_queries = query_list[i: i + args.batch_size]
+        batch_qids = qid_list[i: i + args.batch_size]
 
         # 1. Retrieve top-k passages using the fine-tuned retriever
         prefix_queries = ["query: " + q for q in batch_queries]
@@ -118,7 +120,39 @@ def create_hard_negatives(args):
                 if rowid not in rowid2pt:
                     continue
 
+                retrieved_pid, retrieved_text = rowid2pt[rowid]
 
+                if retrieved_pid in true_pos_pids:
+                    # This is a TRUE POSITIVE
+                    new_training_examples.append(
+                        {"query": query_text, "passage": retrieved_text, "label": 1}
+                    )
+                    added_positive = True
+                else:
+                    # This is a HARD NEGATIVE
+                    new_training_examples.append(
+                        {"query": query_text, "passage": retrieved_text, "label": 0}
+                    )
+
+            # If the retriever didn't find the positive, find it in the DB and add it
+            if not added_positive:
+                for pos_pid in true_pos_pids:
+                    # Manually fetch this positive passage
+                    sql = f"SELECT text FROM passages WHERE pid = ?"
+                    res = cur.execute(sql, (pos_pid,)).fetchone()
+                    if res:
+                        pos_text = res[0]
+                        new_training_examples.append(
+                            {"query": query_text, "passage": pos_text, "label": 1}
+                        )
+    conn.close()
+
+    # 4. Save the new dataset as JSONL
+    logging.info(f"\nGenerated {len(new_training_examples)} new training pairs.")
+    with open(args.output_file, 'w', encoding='utf-8') as f:
+        for ex in new_training_examples:
+            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    logging.info(f"New reranker training set saved to: {args.output_file}")
 
 
 if __name__ == "__main__":
@@ -144,5 +178,3 @@ if __name__ == "__main__":
     if not os.path.exists(args.retriever_model_path):
         logging.error(f"Retriever model not found at {args.retriever_model_path}")
         sys.exit(1)
-
-
