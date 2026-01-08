@@ -7,6 +7,7 @@ from typing import Union, List, Dict
 from sentence_transformers import SentenceTransformer
 import faiss
 import sqlite3
+from tqdm import tqdm
 
 # --- Configuration ---
 # How many passages to retrieve from the retriever to find hard negatives
@@ -78,6 +79,44 @@ def create_hard_negatives(args):
     # --- Start Mining ---
     new_training_examples = []
 
+    for i in tqdm(range(0, len(query_list), args.batch_size), desc="Mining hard negatives"):
+        batch_queries = query_list[i : i + args.batch_size]
+        batch_qids = qid_list[i : i + args.batch_size]
+
+        # 1. Retrieve top-k passages using the fine-tuned retriever
+        prefix_queries = ["query: " + q for q in batch_queries]
+        q_embs = retriever.encode(
+            prefix_queries, convert_to_numpy=True, normalize_embeddings=True,
+            batch_size=len(batch_queries), show_progress=False
+        )
+
+        # D = distances, I = rowids
+        D, I = index.search(q_embs, TOP_K_RETRIEVER)
+
+        # 2. Get all rowids to fetch from DB
+        need_rowids = tuple(set(int(rid) for row in I for rid in row.tolist()))
+        if not need_rowids:
+            continue
+
+        placeholders = ",".join(["?"] * len(need_rowids))
+        sql = f"SELECT rowid, pid, text FROM passages WHERE rowid IN ({placeholders})"
+        rows = cur.execute(sql, need_rowids).fetchall()
+        rowid2pt = {rid: (pid, text) for (rid, pid, text) in rows}
+
+        # 3. Create (query, passage, label) pairs
+        for j, qid in enumerate(batch_qids):
+            query_text = queries[qid]
+            true_pos_pids = qid_to_pos_pids[qid]
+
+            # Get retrieved rowids for this query
+            retrieved_rowids = I[j].tolist()
+
+            # Store one true positive (if found)
+            added_positive = False
+
+            for rowid in retrieved_rowids:
+                if rowid not in rowid2pt:
+                    continue
 
 
 
