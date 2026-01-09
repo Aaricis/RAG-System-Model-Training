@@ -369,6 +369,9 @@ def fine_tune_e5_small(args):
     # 4. Prepare the Evaluator
     evaluator = prepare_evaluator(args)
 
+    metrics_before = evaluator(model)
+    logging.info(f'Metrics Before: {metrics_before}')
+
     # 5. Train arguments
 
     output_dir = os.path.join(args.output_dir,
@@ -414,6 +417,16 @@ def fine_tune_e5_small(args):
     trainer.train()
     logger.info(f"\nFine-tuning complete. Best model saved to {output_dir}")
 
+    # 拿到best model
+    best_model = trainer.model
+
+    # 导出为SentenceTransformer模型
+    best_model.save(output_dir)
+
+    # 用best model做最终评估
+    metrics_after = evaluator(best_model)
+    logging.info(f'Metrics After: {metrics_after}')
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -448,8 +461,5 @@ if __name__ == "__main__":
                         default=100, help="Evaluation steps for evaluator")
 
     args = parser.parse_args()
-
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
 
     fine_tune_e5_small(args)
