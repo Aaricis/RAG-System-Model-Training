@@ -11,6 +11,9 @@ from sentence_transformers import LoggingHandler
 from sentence_transformers.cross_encoder import CrossEncoder, CrossEncoderTrainingArguments, CrossEncoderTrainer
 from sentence_transformers.cross_encoder.evaluation import CrossEncoderRerankingEvaluator
 from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
+from sentence_transformers.training_args import BatchSamplers
+
+
 #
 # parser = argparse.ArgumentParser()
 # parser.add_argument("--train_data_path", type=str, default="./data/train.txt")
@@ -204,9 +207,10 @@ def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict
                     data.append(json.loads(line))
                 except json.JSONDecodeError as e:
                     print(
-                        f"Skipping malformed JSON line in {file_path}: Line {i+1}. Error: {e}", file=sys.stderr)
+                        f"Skipping malformed JSON line in {file_path}: Line {i + 1}. Error: {e}", file=sys.stderr)
 
         return data
+
 
 def prepare_train_examples(args):
     """
@@ -215,7 +219,6 @@ def prepare_train_examples(args):
     training_data = load_data(args.train_file, is_single_object=False)
     queries, evidences, labels = [], [], []
     skipped_count = 0
-
 
     # Create samples list
     for item in training_data:
@@ -242,6 +245,7 @@ def prepare_train_examples(args):
         "label": labels
     }
     return train_examples
+
 
 def prepare_reranker_evaluator(args):
     """
@@ -289,7 +293,35 @@ def prepare_reranker_evaluator(args):
 
         # Get the NEGATIVE passages from test_open.txt's "evidences"
         passages = item.get('evidences', [])
+        labels = item.get('retrieval_labels', [])
 
+        for text, label in zip(passages, labels):
+            if label == 0 and text.strip():
+                negative_texts.add(text)
+
+        # We must have at least one positive AND one negative to evaluate
+        if positive_texts and negative_texts:
+            eval_samples.append({
+                'query': query,
+                'positive': list(positive_texts),
+                'negative': list(negative_texts)
+            })
+        else:
+            skipped_queries += 1
+
+    logging.info(f"Created {len(eval_samples)} valid samples for the reranking evaluator.")
+    logging.info(f"Skipped {skipped_queries} queries (missing positives in qrels or negatives in evidences).")
+
+    if not eval_samples:
+        raise ValueError(
+            "No valid evaluation samples were created. Check your test/qrels/corpus files.")
+
+    return CrossEncoderRerankingEvaluator(
+        samples=eval_samples,
+        at_k=10,
+        name="test_eval",
+        batch_size=args.eval_batch_size,
+    )
 
 
 def fine_tune_reranker(args):
@@ -300,9 +332,50 @@ def fine_tune_reranker(args):
     # 2. Prepare Training Data
     train_examples = prepare_train_examples(args)
 
-    # 3. Create the Evaluator
+    # 3. Define the Loss Function
+    train_loss = BinaryCrossEntropyLoss(model)
 
+    # 4. Create the Evaluator
+    evaluator = prepare_reranker_evaluator(args)
 
+    metrics_before = evaluator(model)
+    logging.info(f'Metrics Before: {metrics_before}')
+
+    # 5. Train arguments
+    output_dir = os.path.join(args.output_dir,
+                              f'train_cross-encoder-bcel-{args.model_name_or_path.split("/")[-1]}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+    os.makedirs(output_dir, exist_ok=True)
+
+    training_args = CrossEncoderTrainingArguments(
+        # Required parameter:
+        output_dir=output_dir,
+        # Optional training parameters:
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
+        learning_rate=2e-5,
+        warmup_ratio=0.1,
+        fp16=True,  # Set to False if you get an error that your GPU can't run on FP16
+        bf16=False,  # Set to True if you have a GPU that supports BF16
+        batch_sampler=BatchSamplers.NO_DUPLICATES,  # losses that use "in-batch negatives" benefit from no duplicates
+        load_best_model_at_end=True,
+        # Optional tracking/debugging parameters:
+        eval_strategy="steps",
+        eval_steps=args.evaluation_steps,
+        save_strategy="steps",
+        save_steps=args.evaluation_steps,
+        save_total_limit=2,
+        logging_steps=50,
+        logging_first_step=True,
+        seed=12,
+
+        report_to=["tensorboard"],
+        # 关键修改：指定实际存在的指标
+        metric_for_best_model="eval_test_rerank_mrr@10",  # ✅ 使用 MRR@10 作为评估指标
+
+        # 重要：对于 MRR/MAP，越大越好，需设置 greater_is_better=True
+        greater_is_better=True,
+    )
 
 
 if __name__ == "__main__":
@@ -313,7 +386,7 @@ if __name__ == "__main__":
                         help="Pretrained cross-encoder model to load.")
 
     # --- Data Path Arguments ---
-    parser.add_argument("--output_dir", type=str, default="./models/reranker",
+    parser.add_argument("--output_dir", type=str, default="./output/reranker",
                         help="Directory to save the trained model.")
     parser.add_argument("--train_file", type=str, default="./data/reranker_train_hard_neg.jsonl",
                         help="Path to the pre-generated JSONL training file.")
@@ -338,4 +411,3 @@ if __name__ == "__main__":
     parser.add_argument("--use_fp16", action="store_true",
                         help="Whether to use 16-bit precision (mixed precision).")
     args = parser.parse_args()
-
