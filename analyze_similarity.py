@@ -8,6 +8,9 @@ from typing import Union, List, Dict, Counter
 import matplotlib.pyplot as plt
 from sentence_transformers import SentenceTransformer, util
 
+# 配置日志级别为INFO，输出到控制台
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
 
 def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict], Dict]:
     """
@@ -50,26 +53,87 @@ def analyze_similarity(args):
     logging.info(f"Loading dataset from {args.data_dir}")
     data = load_data(args.data_dir, is_single_object=False)
 
-    qid_sim = {}
+    # Step 1：先收集所有文本（一次遍历）
+    qids = []
+    queries = []
+    positives = []
+    all_negatives = []  # flat list
+    neg_ranges = []  # (start, end) index per qid
+
     for item in data:
-        qid = item.get('qid')
-        query_text_raw = item.get('rewrite', '').strip()
-        # Apply E5 prefix to query
+        qid = item.get("qid")
+        query_text_raw = item.get("rewrite", "").strip()
+        if not qid or not query_text_raw:
+            continue
+
         query = f"query: {query_text_raw}"
 
-        evidences = item.get('evidences', [])
-        labels = item.get('retrieval_labels', [])
-        positive = ''
-        negatives = []
-        for evidence, label in zip(evidences, labels):
-            evidence_text = f"passage: {evidence.strip()}"
-            if label == 1:
-                positive = evidence_text
-            else:
-                negatives.append(evidence_text)
+        evidences = item.get("evidences", [])
+        labels = item.get("retrieval_labels", [])
 
-        gaps = cal_similarity(retriever, query, positive, negatives)
+        pos = None
+        negs = []
+
+        for ev, lb in zip(evidences, labels):
+            ev_text = f"passage: {ev.strip()}"
+            if lb == 1:
+                pos = ev_text
+            else:
+                negs.append(ev_text)
+
+        if pos is None or not negs:
+            continue
+
+        qids.append(qid)
+        queries.append(query)
+        positives.append(pos)
+
+        start = len(all_negatives)
+        all_negatives.extend(negs)
+        end = len(all_negatives)
+        neg_ranges.append((start, end))
+
+    # Step 2：批量 encode（性能关键）
+    logging.info("Encoding queries...")
+    q_embs = retriever.encode(
+        queries,
+        batch_size=args.batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+    )
+
+    logging.info("Encoding positives...")
+    p_embs = retriever.encode(
+        positives,
+        batch_size=args.batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=True
+    )
+
+    logging.info("Encoding negatives...")
+    n_embs = retriever.encode(
+        all_negatives,
+        batch_size=args.batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=True
+    )
+
+    # Step 3：向量相似度 + gap 计算
+    qid_sim = {}
+
+    for i, qid in enumerate(qids):
+        q_emb = q_embs[i]
+        p_emb = p_embs[i]
+
+        start, end = neg_ranges[i]
+        neg_embs = n_embs[start:end]
+
+        s_pos = util.cos_sim(q_emb, p_emb).item()
+        s_negs = util.cos_sim(q_emb, neg_embs).tolist()[0]
+
+        gaps = [s_pos - s for s in s_negs]
         qid_sim[qid] = gaps
+
     return qid_sim
 
 
@@ -110,16 +174,31 @@ def plot_stats(stats):
     counts = [stats.get(k, 0) for k in labels]
 
     plt.figure(figsize=(6, 4))
-    plt.bar(labels, counts)
+    bars = plt.bar(labels, counts)
+
     plt.xlabel("Negative difficulty")
     plt.ylabel("Count")
     plt.title("Negative Difficulty Distribution (Count)")
+
+    # 在柱子上标注数值
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            height,
+            f"{int(height)}",
+            ha="center",
+            va="bottom",
+            fontsize=10
+        )
+
     plt.tight_layout()
 
     # 保存
     save_dir = os.path.join(args.output_dir, "negative_difficulty_count.png")
     plt.savefig(save_dir, dpi=300)
     plt.close()
+    logging.info(f"negative_difficulty_count.png have saved to {save_dir}")
 
     # 占比分布直方图
     total = sum(stats.values())
@@ -141,31 +220,7 @@ def plot_stats(stats):
     save_dir = os.path.join(args.output_dir, "negative_difficulty_ratio.png")
     plt.savefig(save_dir, dpi=300)
     plt.close()
-
-
-def cal_similarity(model, query, positive, negatives):
-    """
-    计算相似度gap
-    :param model: retriever模型
-    :param query: query
-    :param positive: 正例
-    :param negatives: 负例
-    :return: gap
-    """
-    embs = model.encode(
-        [query, positive] + negatives,
-        normalize_embeddings=True,
-    )
-
-    q_emb = embs[0]
-    p_emb = embs[1]
-    n_embs = embs[2:]
-
-    s_pos = util.cos_sim(q_emb, p_emb).item()
-    s_negs = util.cos_sim(q_emb, n_embs).tolist()
-
-    gaps = [s_pos - s for s in s_negs]
-    return gaps
+    logging.info(f"negative_difficulty_ratio.png have saved to {save_dir}")
 
 
 if __name__ == '__main__':
@@ -177,8 +232,13 @@ if __name__ == '__main__':
     parser.add_argument("--retriever_model_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./output/similarity",
                         help="Directory to save the results")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Embedding batch size.")
 
     args = parser.parse_args()
+
+    # 创建output_dir
+    os.makedirs(args.output_dir, exist_ok=True)
 
     similarities = analyze_similarity(args)
     statistics = analyze_negative_difficulty(similarities)
