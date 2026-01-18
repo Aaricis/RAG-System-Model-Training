@@ -66,9 +66,7 @@ def load_data(file_path: str, is_single_object: bool = False) -> Union[List[Dict
 
 def prepare_training_examples(args, model_name: str):
     """
-        Parses data from train.txt, which contains the query, positive passage,
-        and negative passages all in one object.
-
+        Parses data from train.txt, which contains the query, positive passage.
         This function does NOT load corpus.txt for training.
     """
     logging.info("Loading tokenizer and data files for pre-validation...")
@@ -131,7 +129,7 @@ def prepare_training_examples(args, model_name: str):
         "positive": passages,
     })
 
-    logging.info(f"Prepared {len(queries)} valid training triplets (from {len(train_data)} queries).")
+    logging.info(f"Prepared {len(queries)} valid training pairs (from {len(train_data)} queries).")
     logging.info(f"Skipped {skipped_count} invalid items or triplet combinations.")
 
     return train_dataset
