@@ -10,6 +10,9 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
+# 配置日志级别为INFO，输出到控制台
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
 # --- Configuration ---
 # How many passages to retrieve from the retriever to find hard negatives
 TOP_K_RETRIEVER = 20
@@ -45,7 +48,7 @@ def create_hard_negatives(args):
     logging.info("Loading FAISS index and SQLite DB...")
     index = faiss.read_index(os.path.join(args.index_folder, args.index_file))
 
-    conn = sqlite3.connect(os.path.join(args.index_foler, args.sqlite_file))
+    conn = sqlite3.connect(os.path.join(args.index_folder, args.sqlite_file))
     cur = conn.cursor()
 
     logging.info("Loading qrels (ground truth)...")
@@ -69,7 +72,7 @@ def create_hard_negatives(args):
 
         # Get all positive PIDs for this query from qrels
         if qid in qrels_map:
-            qid_to_pos_pids[qid] = {pid for pid in qrels_map[qid].key()}
+            qid_to_pos_pids[qid] = {pid for pid in qrels_map[qid].keys()}
         else:
             # Skip queries that have no positive passages in qrels
             continue
@@ -178,3 +181,5 @@ if __name__ == "__main__":
     if not os.path.exists(args.retriever_model_path):
         logging.error(f"Retriever model not found at {args.retriever_model_path}")
         sys.exit(1)
+
+    create_hard_negatives(args)
