@@ -172,9 +172,9 @@ def prepare_evaluator(args):
         queries,
         corpus,
         relevant_docs,
-        mrr_at_k=[10],
-        precision_recall_at_k=[10],
-        accuracy_at_k=[10],
+        mrr_at_k=[10, 20, 50],
+        accuracy_at_k=[1, 5, 10, 20, 50],
+        precision_recall_at_k=[1, 5, 10, 20, 50],
         name="test_eval",
         batch_size=args.eval_batch_size,
     )
@@ -189,7 +189,7 @@ def fine_tune_e5_small(args):
     train_examples = prepare_training_examples(args, args.model_name_or_path)
 
     # 3. Define the Loss Function (MNRL handles triplets and in-batch negatives)
-    train_loss = MultipleNegativesRankingLoss(model)
+    train_loss = MultipleNegativesRankingLoss(model, scale=30)
 
     # 4. Prepare the Evaluator
     evaluator = prepare_evaluator(args)
@@ -208,6 +208,7 @@ def fine_tune_e5_small(args):
 
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=2,
 
         eval_strategy="steps",
         eval_steps=args.eval_steps,
