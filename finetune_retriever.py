@@ -221,6 +221,7 @@ def fine_tune_e5_small(args):
 
         fp16=True,
         warmup_ratio=0.1,
+        learning_rate=args.learning_rate,
 
         load_best_model_at_end=True,
         metric_for_best_model="eval_test_eval_cosine_mrr@10",  # ✅ 修正
