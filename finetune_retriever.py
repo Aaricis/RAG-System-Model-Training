@@ -135,6 +135,81 @@ def prepare_training_examples(args, model_name: str):
     return train_dataset
 
 
+def prepare_training_examples_with_negative(args):
+    """
+    Parses data from train.txt, which contains the query, positive passage,
+    and negative passages all in one object.
+
+    This function does NOT load corpus.txt for training.
+    :param args: 参数
+    :return: dataset
+    """
+
+    train_data = load_data(args.train_file, is_single_object=False)
+    logging.info(f"Creating [anchor, positive, neg1, neg2, neg3, neg4] from {args.train_file}...")
+
+    queries, positives = [], []
+    negatives1, negatives2, negatives3, negatives4 = [], [], [], []
+    skipped_count = 0
+    for item in train_data:
+        query_text_raw = item.get('rewrite', '').strip()
+        if not query_text_raw:
+            skipped_count += 1
+            continue
+
+        # Apply E5 prefix to query
+        query_text = f"query: {query_text_raw}"
+
+        passages = item.get('evidences', [])
+        labels = item.get('retrieval_labels', [])
+
+        if not passages or not labels or len(passages) != len(labels):
+            skipped_count += 1
+            continue
+
+        positive_passage_text_raw = ""
+        negative_passage_texts_raw = []
+
+        for i, label in enumerate(labels):
+            passage_text = passages[i].strip()
+            if not passage_text:  # Skip empty passage strings
+                continue
+
+            if label == 1:
+                positive_passage_text_raw = passage_text
+            else:
+                negative_passage_texts_raw.append(passage_text)
+
+        # If no positive passage, we can't create samples.
+        if not positive_passage_text_raw:
+            skipped_count += 1
+            continue
+
+        # Apply E5 prefix to positive
+        pos_passage_text = f"passage: {positive_passage_text_raw}"
+
+        # --- Create [anchor, positive, neg1, neg2, neg3, neg4] for each query ---
+        queries.append(query_text)
+        positives.append(pos_passage_text)
+        # 追加 + 加前缀
+        for tgt, txt in zip([negatives1, negatives2, negatives3, negatives4], negative_passage_texts_raw):
+            tgt.append(f'passage: {txt}')
+
+    logging.info(f"Prepared {len(queries)} valid training samples (from {len(train_data)} queries).")
+    logging.info(f"Skipped {skipped_count} invalid items or triplet combinations.")
+
+    train_dataset = Dataset.from_dict({
+        "anchor": queries,
+        "positive": positives,
+        "negative1": negatives1,
+        "negative2": negatives2,
+        "negative3": negatives3,
+        "negative4": negatives4,
+    })
+
+    return train_dataset
+
+
 def prepare_evaluator(args):
     """
         Loads test queries, corpus, and qrels to create the InformationRetrievalEvaluator.
@@ -186,7 +261,8 @@ def fine_tune_e5_small(args):
     model = SentenceTransformer(args.model_name_or_path)
 
     # 2. Prepare Training Data (NOW CREATES PAIRS from train.txt)
-    train_examples = prepare_training_examples(args, args.model_name_or_path)
+    # train_examples = prepare_training_examples(args, args.model_name_or_path) # (anchor, positive) pairs
+    train_examples = prepare_training_examples_with_negative(args)  # (anchor, positive, negative_1, …, negative_n)
 
     # 3. Define the Loss Function (MNRL handles triplets and in-batch negatives)
     train_loss = MultipleNegativesRankingLoss(model, scale=30)
@@ -208,7 +284,7 @@ def fine_tune_e5_small(args):
 
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=args.grad_accumulate_step,
 
         eval_strategy="steps",
         eval_steps=args.eval_steps,
@@ -286,6 +362,8 @@ if __name__ == "__main__":
                         help="Whether to use 16-bit precision (mixed precision).")
     parser.add_argument("--eval_steps", type=int,
                         default=100, help="Evaluation steps for evaluator")
+    parser.add_argument("--grad_accumulate_step", type=int, default=1,
+                        help="Number of updates steps to accumulate the gradients for, before performing a backward/update pass.")
 
     args = parser.parse_args()
 
