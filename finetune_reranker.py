@@ -11,8 +11,7 @@ from sentence_transformers import LoggingHandler
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder, CrossEncoderTrainingArguments, CrossEncoderTrainer
 from sentence_transformers.cross_encoder.evaluation import CrossEncoderRerankingEvaluator
-from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
-from sentence_transformers.training_args import BatchSamplers
+from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss, RankNetLoss
 from sentence_transformers.util import mine_hard_negatives
 
 # 设定日志
@@ -95,6 +94,53 @@ def prepare_train_examples(args):
     return Dataset.from_dict(train_examples)
 
 
+def prepare_train_examples_for_rank_net_loss(args):
+    """
+    Parses the train dataset for RankNetLoss
+    :param args: 参数
+    :return: Dataset
+    """
+    train_data = load_data(args.train_file, is_single_object=False)
+    logging.info(f"Creating (query, [doc1, doc2, …, docN]) from {args.train_file}...")
+
+    queries, docs, labels = [], [], []
+    skipped_count = 0
+    for item in train_data:
+        query = item.get('rewrite', '').strip()
+        if not query:
+            skipped_count += 1
+            continue
+
+        cur_passages = item.get('evidences', [])
+        cur_labels = item.get('retrieval_labels', [])
+
+        if not cur_passages or not cur_labels or len(cur_passages) != len(cur_labels):
+            skipped_count += 1
+            continue
+
+        doc = []
+        for i, label in enumerate(cur_labels):
+            passage_text = cur_passages[i].strip()
+            if not passage_text:  # Skip empty passage strings
+                continue
+            doc.append(passage_text)
+
+        queries.append(query)
+        docs.append(doc)
+        labels.append(cur_labels)
+
+    logging.info(f"Prepared {len(queries)} valid training samples (from {len(train_data)} queries).")
+    logging.info(f"Skipped {skipped_count} invalid items or triplet combinations.")
+
+    train_dataset = Dataset.from_dict({
+        "query": queries,
+        "docs": docs,
+        "labels": labels
+    })
+
+    return train_dataset
+
+
 def mine_negatives(args):
     """
     Add hard negatives to a dataset of (anchor, positive) pairs.
@@ -144,7 +190,7 @@ def mine_negatives(args):
         relative_margin=0.05,
         batch_size=args.batch_size,
         use_faiss=True,
-        output_format="labeled-pair" # Apply for BinaryCrossEntropyLoss
+        output_format="labeled-pair"  # Apply for BinaryCrossEntropyLoss
     )
 
     return hard_dataset
@@ -234,10 +280,12 @@ def fine_tune_reranker(args):
     model = CrossEncoder(model_name_or_path=args.model_name_or_path, num_labels=1, max_length=512)
 
     # 2. Prepare Training Data
-    train_examples = prepare_train_examples(args)
+    # train_examples = prepare_train_examples(args) # for BinaryCrossEntropyLoss
+    train_examples = prepare_train_examples_for_rank_net_loss(args) # for RankNetLoss
 
     # 3. Define the Loss Function
-    train_loss = BinaryCrossEntropyLoss(model)
+    # train_loss = BinaryCrossEntropyLoss(model)
+    train_loss = RankNetLoss(model)
 
     # 4. Create the Evaluator
     evaluator = prepare_reranker_evaluator(args)
@@ -247,7 +295,7 @@ def fine_tune_reranker(args):
 
     # 5. Train arguments
     output_dir = os.path.join(args.output_dir,
-                              f'train_cross-encoder-bcel-{args.model_name_or_path.split("/")[-1]}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+                              f'train_cross-encoder-rnl-{args.model_name_or_path.split("/")[-1]}-{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
     os.makedirs(output_dir, exist_ok=True)
 
     training_args = CrossEncoderTrainingArguments(
@@ -257,11 +305,11 @@ def fine_tune_reranker(args):
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
-        learning_rate=2e-5,
+        gradient_accumulation_steps=args.grad_accumulate_step,
+        learning_rate=args.learning_rate,
         warmup_ratio=0.1,
         fp16=True,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=False,  # Set to True if you have a GPU that supports BF16
-        batch_sampler=BatchSamplers.NO_DUPLICATES,  # losses that use "in-batch negatives" benefit from no duplicates
         load_best_model_at_end=True,
         # Optional tracking/debugging parameters:
         eval_strategy="steps",
@@ -307,9 +355,9 @@ if __name__ == "__main__":
         description="Fine-tune a cross-encoder (reranker) model.")
 
     parser.add_argument("--model_name_or_path", type=str, default="cross-encoder/ms-marco-MiniLM-L12-v2",
-                        help="Pretrained cross-encoder model to load.")
+                        help="Pretrained cross-encoder model to be loaded.")
     # parser.add_argument("--retriever_model_path", type=str, required=True,
-    #                     help="Retriever model to load.")
+    #                     help="Retriever model to be loaded.")
 
     # --- Data Path Arguments ---
     parser.add_argument("--output_dir", type=str, default="./output/reranker",
@@ -338,6 +386,8 @@ if __name__ == "__main__":
                         help="Whether to use 16-bit precision (mixed precision).")
     parser.add_argument("--eval_steps", type=int,
                         default=100, help="Evaluation steps for evaluator")
+    parser.add_argument("--grad_accumulate_step", type=int, default=1,
+                        help="Number of updates steps to accumulate the gradients for, before performing a backward/update pass.")
     args = parser.parse_args()
 
     # hard_negatives = mine_negatives(args)
