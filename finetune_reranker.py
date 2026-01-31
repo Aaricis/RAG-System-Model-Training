@@ -122,6 +122,7 @@ def mine_negatives(args):
     """
     Add hard negatives to a dataset of (anchor, positive) pairs.
     """
+    logging.info('Mining hard negatives......')
 
     # 1. Load train dataset
     train_data = load_data(args.train_file, is_single_object=False)
@@ -137,11 +138,12 @@ def mine_negatives(args):
         for i, label in enumerate(labels):
             if label == 1:
                 pos = evidences[i].strip()
+                break
 
         if pos:
             train_dataset.append({
                 "query": f'query: {query}',  # Apply E5 prefix
-                "positive": [f'passage: {pos}']  # Apply E5 prefix
+                "positive": f'passage: {pos}'  # Apply E5 prefix
             })
 
     # 2. Load Corpus (passages)
@@ -162,13 +164,17 @@ def mine_negatives(args):
         corpus=corpus,
         anchor_column_name="query",
         positive_column_name="positive",
-        num_negatives=4,
+        num_negatives=8,
         sampling_strategy="top",
-        relative_margin=0.05,
-        batch_size=args.batch_size,
+        relative_margin = 0.1,
+        batch_size=128,
         use_faiss=True,
-        output_format="labeled-pair"  # Apply for BinaryCrossEntropyLoss
+        # output_format="labeled-pair",  # Apply for BinaryCrossEntropyLoss
+        output_format="labeled-list",  # Apply for LambdaLoss
+        output_scores=True
     )
+
+    logging.info(f'Mined {len(hard_dataset)} train samples.')
 
     return hard_dataset
 
@@ -258,7 +264,8 @@ def fine_tune_reranker(args):
 
     # 2. Prepare Training Data
     # train_examples = prepare_train_examples(args) # for BinaryCrossEntropyLoss
-    train_examples = prepare_train_examples_for_lambda_loss(args)  # for RankNetLoss
+    # train_examples = prepare_train_examples_for_lambda_loss(args)  # for RankNetLoss
+    train_examples = mine_negatives(args)  # <- mined hard negatives
 
     # 3. Define the Loss Function
     # train_loss = BinaryCrossEntropyLoss(model)
@@ -334,8 +341,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name_or_path", type=str, default="cross-encoder/ms-marco-MiniLM-L12-v2",
                         help="Pretrained cross-encoder model to be loaded.")
-    # parser.add_argument("--retriever_model_path", type=str, required=True,
-    #                     help="Retriever model to be loaded.")
+    parser.add_argument("--retriever_model_path", type=str, required=True,
+                        help="Retriever model which to mine hard negatives.")
 
     # --- Data Path Arguments ---
     parser.add_argument("--output_dir", type=str, default="./output/reranker",
@@ -367,7 +374,5 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accumulate_step", type=int, default=1,
                         help="Number of updates steps to accumulate the gradients for, before performing a backward/update pass.")
     args = parser.parse_args()
-
-    # hard_negatives = mine_negatives(args)
 
     fine_tune_reranker(args)
