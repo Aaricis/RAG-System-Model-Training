@@ -94,16 +94,15 @@ class RAGEnv(gym.Env):
 
         # Observation:
         # [
-        #   scores(TopK),
-        #   mean(scores),
-        #   std(scores),
-        #   gap12,
-        #   gap1k,
-        #   entropy(scores),
-        #   query_len_norm
+        #   scores_norm(TopK),
+        #   gap12_norm,
+        #   gap1k_norm,
+        #   entropy_norm,
+        #   query_len_norm,
+        #   avg_ctx_len_norm
         # ]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.top_k + 6,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.top_k + 5,), dtype=np.float32
         )
 
         logging.info("Initializing RAGEnv...")
@@ -143,7 +142,7 @@ class RAGEnv(gym.Env):
         self.current_qid = ""
 
     def _get_obs_and_reranked_data(self):
-        # 1. Sample test case (random for RL)
+        # ---- 1. Random sample test case ----
         idx = np.random.randint(0, len(self.tests))
         test_case = self.tests[idx]
 
@@ -151,7 +150,7 @@ class RAGEnv(gym.Env):
         self.current_gold_answer = test_case["gold_answer"]
         self.current_qid = test_case["qid"]
 
-        # 2. Retrieve
+        # ---- 2. Retrieve ----
         prefix_query = "query: " + self.current_query
         q_emb = self.retriever.encode(
             [prefix_query], convert_to_numpy=True, normalize_embeddings=True
@@ -161,7 +160,7 @@ class RAGEnv(gym.Env):
         rowids = I[0].tolist()
         need_rowids = set(int(rid) for rid in rowids)
 
-        # 3. DB fetch
+        # ---- 3. DB fetch ----
         rowid2pt = {}
         if need_rowids:
             placeholders = ",".join(["?"] * len(need_rowids))
@@ -177,7 +176,7 @@ class RAGEnv(gym.Env):
             cand_ids.append(tup[0])
             cand_texts.append(tup[1])
 
-        # 4. Rerank
+        # ---- 4. Rerank ----
         reranked_data = []
         scores_list = []
 
@@ -194,7 +193,7 @@ class RAGEnv(gym.Env):
 
         self.current_reranked_data = reranked_data
 
-        # ---- Observation build ----
+        # ---- 5. Score padding ----
         if len(scores_list) == 0:
             scores_list = np.zeros(self.top_k, dtype=np.float32)
 
@@ -204,24 +203,47 @@ class RAGEnv(gym.Env):
 
         scores = scores_list[:self.top_k]
 
-        # normalize scores
-        mu, std = scores.mean(), scores.std() + 1e-6
+        # ---- 6. Normalize scores ----
+        mu = scores.mean()
+        std = scores.std() + 1e-6
         scores_norm = (scores - mu) / std
 
-        # stats
+        # ---- 7. Gap + entropy ----
         gap12 = scores_norm[0] - scores_norm[1] if self.top_k > 1 else 0.0
         gap1k = scores_norm[0] - scores_norm[-1]
 
         p = np.exp(scores_norm)
         p = p / (p.sum() + 1e-8)
         entropy = -np.sum(p * np.log(p + 1e-8))
+        entropy_norm = entropy / np.log(self.top_k + 1e-8)
 
-        query_len = len(self.current_query.split()) / 30.0
+        gap12_norm = np.tanh(gap12)
+        gap1k_norm = np.tanh(gap1k)
 
+        # ---- 8. Query token length (Chinese safe) ----
+        q_tokens = self.llm_tokenizer.encode(self.current_query, add_special_tokens=False)
+        q_len = len(q_tokens)
+        MAX_Q_LEN = 64
+        query_len_norm = min(q_len, MAX_Q_LEN) / MAX_Q_LEN
+
+        # ---- 9. Context token cost ----
+        ctx_lens = [
+            len(self.llm_tokenizer.encode(t, add_special_tokens=False))
+            for _, _, t in reranked_data[:self.top_k]
+        ]
+
+        if len(ctx_lens) == 0:
+            avg_ctx_len_norm = 0.0
+        else:
+            avg_ctx = float(np.mean(ctx_lens))
+            MAX_CTX_LEN = 256
+            avg_ctx_len_norm = min(avg_ctx, MAX_CTX_LEN) / MAX_CTX_LEN
+
+        # ---- 10. Final Observation ----
         obs = np.concatenate([
             scores_norm,
-            [mu, std, gap12, gap1k, entropy, query_len]
-        ]).astype(np.float32) # shape(top_k + 6, )
+            [gap12_norm, gap1k_norm, entropy_norm, query_len_norm, avg_ctx_len_norm]
+        ]).astype(np.float32)
 
         return obs
 
