@@ -10,13 +10,13 @@ import os
 import sqlite3
 import faiss
 import json
-
+from utils import get_inference_system_prompt, get_inference_user_prompt, parse_generated_answer
 
 # 配置日志级别为INFO，输出到控制台
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # --- RAG Parameters ---
-TOP_K = 10 # Retriever 檢索 K 篇
+TOP_K = 10  # Retriever 檢索 K 篇
 GEN_MAXLEN = 1280
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -26,7 +26,7 @@ MAX_TOP_M = TOP_K
 
 # 由于 llm 很慢，我们只用少量数据
 N_TEST_CASES_FOR_RL = 100  # 只取前 n 笔 test data 来训练/测试 RL
-TOTAL_TIMESTEPS = 100     # RL 总共只训练 n 步 (即跑 n 次 RAG 流程)
+TOTAL_TIMESTEPS = 100  # RL 总共只训练 n 步 (即跑 n 次 RAG 流程)
 
 
 def load_test_data(test_path, qrels_path):
@@ -67,9 +67,89 @@ def load_test_data(test_path, qrels_path):
                 })
     return tests
 
+# Rouge-L (Chinese Safe)
+def lcs_length(a, b):
+    n, m = len(a), len(b)
+    dp = [[0]*(m+1) for _ in range(n+1)]
+    for i in range(n):
+        for j in range(m):
+            if a[i] == b[j]:
+                dp[i+1][j+1] = dp[i][j] + 1
+            else:
+                dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+    return dp[n][m]
+
+
+def rouge_l_f1(pred, gold):
+    if len(pred) == 0 or len(gold) == 0:
+        return 0.0
+
+    pred_chars = list(pred)
+    gold_chars = list(gold)
+
+    lcs = lcs_length(pred_chars, gold_chars)
+
+    prec = lcs / (len(pred_chars) + 1e-8)
+    rec = lcs / (len(gold_chars) + 1e-8)
+
+    if prec + rec == 0:
+        return 0.0
+
+    f1 = (2 * prec * rec) / (prec + rec)
+    return float(f1)
+
+
 # -----------------------
 # RAG RL Environment
 # -----------------------
+def compute_reward(
+        pred_ans: str,
+        gold_ans: str,
+        reranked_data,
+        top_m: int,
+        scorer,
+        tokenizer,
+        w_cos=0.6,
+        w_rouge=0.4,
+        lambda_cost=0.0005,
+):
+    """
+    Returns PPO-safe reward.
+    """
+
+    # -------- Semantic (Cosine) --------
+    emb_res = scorer.encode([pred_ans], convert_to_tensor=True, normalize_embeddings=True)
+    emb_gold = scorer.encode([gold_ans], convert_to_tensor=True, normalize_embeddings=True)
+    cos = util.cos_sim(emb_res, emb_gold)[0][0].item()
+    cos_norm = (cos + 1) / 2  # -> [0,1]
+
+    # -------- Lexical (Rouge-L Chinese) --------
+    rouge = rouge_l_f1(pred_ans, gold_ans)  # [0,1]
+
+    quality = w_cos * cos_norm + w_rouge * rouge
+
+    # -------- Token Cost --------
+    ctx_tokens = 0
+    for _, _, t in reranked_data[:top_m]:
+        ctx_tokens += len(tokenizer.encode(t, add_special_tokens=False))
+
+    cost = lambda_cost * ctx_tokens
+
+    # -------- Final Reward --------
+    reward = quality - cost
+
+    # PPO safe clip
+    reward = float(np.clip(reward, -1.0, 1.0))
+
+    return reward, {
+        "cosine": cos_norm,
+        "rouge_l": rouge,
+        "ctx_tokens": ctx_tokens,
+        "quality": quality,
+        "cost": cost
+    }
+
+
 class RAGEnv(gym.Env):
     """
     自定义gym环境，用于RAG流程中的Top_M选择。
@@ -104,6 +184,7 @@ class RAGEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.top_k + 5,), dtype=np.float32
         )
+        self.last_obs = None
 
         logging.info("Initializing RAGEnv...")
 
@@ -115,7 +196,7 @@ class RAGEnv(gym.Env):
         self.llm_model = AutoModelForCausalLM.from_pretrained(
             args.generator_model,
             torch_dtype="auto",
-            device_map = "auto"
+            device_map="auto"
         )
         self.scorer = SentenceTransformer(args.scoring_model, device=DEVICE)
 
@@ -252,8 +333,86 @@ class RAGEnv(gym.Env):
 
         observation = self._get_obs_and_reranked_data()
         info = {}
+        self.last_obs = observation.copy()
+
         return observation, info
 
+    def step(self, action):
+        # ---- 1. Map Action ----
+        top_m = int(action) + 1
+
+        # ---- 2. Select ----
+        if len(self.current_reranked_data) == 0:
+            context_list = []
+        else:
+            context_list = [text for _, _, text in self.current_reranked_data[:top_m]]
+
+        # ---- 3. Generate ----
+        try:
+            messages = [
+                {"role": "system", "content": get_inference_system_prompt()},
+                {"role": "user", "content": get_inference_user_prompt(self.current_query, context_list)}
+            ]
+
+            self.llm_tokenizer.padding_side = "left"
+            rendered_prompt = self.llm_tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+
+            inputs = self.llm_tokenizer(
+                [rendered_prompt], padding=True, return_tensors="pt"
+            ).to(self.llm_model.device)
+
+            with torch.no_grad():
+                outs = self.llm_model.generate(**inputs, max_new_tokens=GEN_MAXLEN)
+
+            decoded = self.llm_tokenizer.batch_decode(outs, skip_special_tokens=True)
+            pred_ans = parse_generated_answer(decoded[0].strip())
+
+            if pred_ans.strip() == "":
+                pred_ans = " "
+
+        except Exception as e:
+            print("LLM generation failed:", e)
+            pred_ans = " "
+
+        # ---- 4. Reward ----
+        try:
+            reward, reward_info = compute_reward(
+                pred_ans=pred_ans,
+                gold_ans=self.current_gold_answer,
+                reranked_data=self.current_reranked_data,
+                top_m=top_m,
+                scorer=self.scorer,
+                tokenizer=self.llm_tokenizer,
+                w_cos=0.6,
+                w_rouge=0.4,
+                lambda_cost=0.0005
+            )
+        except Exception as e:
+            print("Reward failed:", e)
+            reward = -0.5
+            reward_info = {}
+
+        # ---- 5. Termination ----
+        terminated = True
+        truncated = False
+
+        info = {
+            "qid": self.current_qid,
+            "top_m_selected": top_m,
+            "pred_ans": pred_ans,
+            "gold_answer": self.current_gold_answer,
+            "reward_info": reward_info
+        }
+
+        # ---- 6. Next obs ----
+        # better: return same obs (bandit style) instead of zeros
+        next_obs = self.last_obs.copy() if hasattr(self, "last_obs") else np.zeros(self.top_k + 5, dtype=np.float32)
+
+        return next_obs, reward, terminated, truncated, info
+
+    def close(self):
 
 
 
