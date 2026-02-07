@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import sqlite3
+import sys
 
 import faiss
 import gymnasium as gym
@@ -34,7 +35,7 @@ MAX_TOP_M = TOP_K
 TRAIN_DATA_SIZE = 100  # 只取前 n 笔 test data 来训练/测试 RL
 
 
-def load_training_data(data_path, qrels_path):
+def load_training_data(data_path: str, qrels_path: str):
     """
     Load test data from file.
     :param data_path: test data path
@@ -73,6 +74,24 @@ def load_training_data(data_path, qrels_path):
     return data
 
 
+def load_offline_data(file_path: str):
+    if not os.path.exists(file_path):
+        print(
+            f"Error: Required file not found at: {file_path}", file=sys.stderr)
+        raise FileNotFoundError(f"Required file not found: {file_path}")
+
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(
+                    f"Skipping malformed JSON line in {file_path}: Line {i + 1}. Error: {e}", file=sys.stderr)
+
+    return data
+
+
 # Rouge-L (Chinese Safe)
 def lcs_length(a, b):
     n, m = len(a), len(b)
@@ -108,6 +127,7 @@ def rouge_l_f1(pred, gold):
 # -----------------------
 # RAG RL Environment
 # -----------------------
+
 def compute_reward(
         pred_ans: str,
         gold_ans: str,
@@ -117,43 +137,53 @@ def compute_reward(
         tokenizer,
         w_cos=0.6,
         w_rouge=0.4,
-        lambda_cost=0.0005,
+        lambda_cost=0.2,
 ):
-    """
-    Returns PPO-safe reward.
-    """
-
-    # -------- Semantic (Cosine) --------
+    # -------- Semantic --------
     emb_res = scorer.encode([pred_ans], convert_to_tensor=True, normalize_embeddings=True)
     emb_gold = scorer.encode([gold_ans], convert_to_tensor=True, normalize_embeddings=True)
     cos = util.cos_sim(emb_res, emb_gold)[0][0].item()
-    cos_norm = (cos + 1) / 2  # -> [0,1]
+    cos_norm = (cos + 1) / 2
 
-    # -------- Lexical (Rouge-L Chinese) --------
-    rouge = rouge_l_f1(pred_ans, gold_ans)  # [0,1]
+    # -------- Lexical --------
+    rouge = rouge_l_f1(pred_ans, gold_ans)
 
-    quality = w_cos * cos_norm + w_rouge * rouge
+    # -------- Confidence --------
+    conf = np.tanh(len(pred_ans) / 50)
+
+    quality = (
+        w_cos * cos_norm +
+        w_rouge * rouge +
+        0.1 * conf
+    )
+    quality = np.clip(quality, 0, 1)
 
     # -------- Token Cost --------
-    ctx_tokens = 0
-    for _, _, t in reranked_data[:top_m]:
-        ctx_tokens += len(tokenizer.encode(t, add_special_tokens=False))
+    ctx_tokens = sum(
+        len(tokenizer.encode(t, add_special_tokens=False))
+        for _, _, t in reranked_data[:top_m]
+    )
 
-    cost = lambda_cost * ctx_tokens
+    cost = np.tanh(ctx_tokens / 800)
 
-    # -------- Final Reward --------
-    reward = quality - cost
+    # -------- Marginal M Penalty --------
+    m_penalty = 0.01 * top_m
 
-    # PPO safe clip
-    reward = float(np.clip(reward, -1.0, 1.0))
+    # -------- Final --------
+    reward = quality - lambda_cost * cost - m_penalty
+
+    # -------- PPO Safe --------
+    reward = float(np.tanh(reward))
 
     return reward, {
         "cosine": cos_norm,
         "rouge_l": rouge,
         "ctx_tokens": ctx_tokens,
         "quality": quality,
-        "cost": cost
+        "cost": cost,
+        "m_penalty": m_penalty
     }
+
 
 
 class RAGEnv(gym.Env):
@@ -189,7 +219,7 @@ class RAGEnv(gym.Env):
         #   avg_ctx_len_norm
         # ]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.top_k + 5,), dtype=np.float32
+            low=-5.0, high=5.0, shape=(self.top_k + 5,), dtype=np.float32
         )
         self.last_obs = None
 
@@ -306,7 +336,7 @@ class RAGEnv(gym.Env):
         gap12 = scores_norm[0] - scores_norm[1] if self.top_k > 1 else 0.0
         gap1k = scores_norm[0] - scores_norm[-1]
 
-        p = np.exp(scores_norm)
+        p = np.exp(scores_norm - scores_norm.max())
         p = p / (p.sum() + 1e-8)
         entropy = -np.sum(p * np.log(p + 1e-8))
         entropy_norm = entropy / np.log(self.top_k + 1e-8)
@@ -341,41 +371,19 @@ class RAGEnv(gym.Env):
 
         return obs
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-
-        observation = self._get_obs_and_reranked_data()
-        info = {}
-        self.last_obs = observation.copy()
-
-        return observation, info
-
-    def step(self, action):
+    def evaluate_action(self, action):
+        """
+        Evaluate Top_M without changing episode state.
+        Used only for offline dataset collection.
+        """
         top_m = int(action) + 1
 
-        # ---------------- OFFLINE MODE ----------------
-        if self.mode == "offline":
-            sample = self.offline_dataset[self.offline_ptr]
-            self.offline_ptr = (self.offline_ptr + 1) % len(self.offline_dataset)
-
-            reward = float(sample["reward"])
-            info = sample.get("info", {})
-
-            terminated = True
-            truncated = False
-
-            next_obs = sample.get("next_obs", sample["obs"])
-
-            return next_obs, reward, terminated, truncated, info
-
-        # ---------------- ONLINE COLLECT MODE ----------------
-        # ---- 1. Select ----
         if len(self.current_reranked_data) == 0:
             context_list = []
         else:
             context_list = [text for _, _, text in self.current_reranked_data[:top_m]]
 
-        # ---- 2. Generate ----
+        # ---- Generate ----
         try:
             messages = [
                 {"role": "system", "content": get_inference_system_prompt()},
@@ -403,48 +411,43 @@ class RAGEnv(gym.Env):
             print("LLM generation failed:", e)
             pred_ans = " "
 
-        # ---- 3. Reward ----
-        try:
-            reward, reward_info = compute_reward(
-                pred_ans=pred_ans,
-                gold_ans=self.current_gold_answer,
-                reranked_data=self.current_reranked_data,
-                top_m=top_m,
-                scorer=self.scorer,
-                tokenizer=self.llm_tokenizer,
-                w_cos=0.6,
-                w_rouge=0.4,
-                lambda_cost=0.0005
-            )
-        except Exception as e:
-            print("Reward failed:", e)
-            reward = -0.5
-            reward_info = {}
+        # ---- Reward ----
+        reward, reward_info = compute_reward(
+            pred_ans=pred_ans,
+            gold_ans=self.current_gold_answer,
+            reranked_data=self.current_reranked_data,
+            top_m=top_m,
+            scorer=self.scorer,
+            tokenizer=self.llm_tokenizer,
+            w_cos=0.6,
+            w_rouge=0.4,
+            lambda_cost=0.0005
+        )
 
-        terminated = True
-        truncated = False
+        return reward, reward_info, pred_ans
 
-        info = {
-            "qid": self.current_qid,
-            "top_m_selected": top_m,
-            "pred_ans": pred_ans,
-            "gold_answer": self.current_gold_answer,
-            "reward_info": reward_info
-        }
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
 
-        # ---- 4. Save Offline Transition ----
-        if hasattr(self, "offline_buffer"):
-            self.offline_buffer.append({
-                "obs": self.last_obs.copy(),
-                "action": action,
-                "reward": reward,
-                "next_obs": self.last_obs.copy(),
-                "info": info
-            })
+        observation = self._get_obs_and_reranked_data()
+        info = {}
+        self.last_obs = observation.copy()
 
-        next_obs = self.last_obs.copy()
+        return observation, info
 
-        return next_obs, reward, terminated, truncated, info
+    def step(self, action):
+        if self.mode == "offline":
+            sample = self.offline_dataset[self.offline_ptr]
+            self.offline_ptr = (self.offline_ptr + 1) % len(self.offline_dataset)
+
+            obs = np.array(sample["state"], dtype=np.float32)
+            action = int(sample["action"])
+            reward = float(sample["reward"])
+
+            terminated = True
+            truncated = False
+
+            return obs, reward, terminated, truncated, {}
 
     def close(self):
         logging.info("Closing RAGEnv......")
@@ -458,23 +461,40 @@ def collect_offline_dataset(env, save_path):
     dataset = []
 
     for _ in range(len(env.train_data)):
+        # ---- reset: retrieve + rerank once ----
         obs, _ = env.reset()
 
+        # cache obs
+        state = obs.tolist()
+
+        # ---- evaluate all Top_M on same retrieval ----
         for m in range(env.top_k):
-            _, reward, _, _, info = env.step(m)
+            reward, reward_info, pred_ans = env.evaluate_action(m)
 
             dataset.append({
-                "state": obs.tolist(),
+                "state": state,
                 "action": int(m),
                 "reward": float(reward),
-                "qid": info["qid"],
-                "top_m": m + 1
+                "qid": env.current_qid,
+                "top_m": m + 1,
+                "reward_info": reward_info,
+                "pred_ans": pred_ans
             })
 
     logging.info(f"Generated {len(dataset)} offline samples.")
+
+    # reward normalization
+    # PPO 非常吃 reward scale
+    rewards = [x["reward"] for x in dataset]
+    mu, std = np.mean(rewards), np.std(rewards)
+
+    for x in dataset:
+        x["reward"] = (x["reward"] - mu) / (std + 1e-6)
+
     with open(save_path, "w", encoding="utf-8") as f:
         for data in dataset:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
     logging.info(f"Generated offline samples saved to {save_path}.")
 
 
@@ -482,29 +502,35 @@ def train(args):
     logging.info("Offline PPO for RAG Top-M")
 
     # -------- Phase 1: Collect --------
-    if not os.path.exists(args.rl_offline_data):
-        logging.info("[Phase1] Collecting offline dataset...")
+    if args.mode == "collect":
+        logging.info("Collecting offline dataset...")
         env = RAGEnv(args, mode="collect")
         collect_offline_dataset(env, args.rl_offline_data)
         env.close()
 
-    # -------- Phase 2: Train --------
-    logging.info("[Phase2] Training PPO offline...")
-    env = DummyVecEnv([lambda: RAGEnv(args, mode="offline", offline_dataset=args.rl_offline_data)])
+    elif args.mode == "train":
+        # -------- Phase 2: Train --------
+        logging.info("Training PPO offline...")
+        offline_dataset = load_offline_data(args.rl_offline_data)
+        env = DummyVecEnv([lambda: RAGEnv(args, mode="offline", offline_dataset=offline_dataset)])
 
-    model = PPO(
-        "RAG_RL_Policy",
-        env,
-        verbose=1,
-        gamma=0.0,
-        learning_rate=3e-4,
-        n_steps=256,
-        batch_size=64,
-        ent_coef=0.01,
-    )
+        # Contextual Bandit PPO
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            gamma=1.0,
+            gae_lambda = 1.0,
+            learning_rate=1e-4,
+            n_steps=128,
+            batch_size=128,
+            ent_coef=0.02,
+            clip_range=0.2,
+        )
 
-    model.learn(total_timesteps=5000)
-    model.save(args.output_dir)
+        model.learn(total_timesteps=5000)
+        model.save(args.output_dir)
+        logging.info(f"RL model saved to {args.output_dir}")
 
 
 if __name__ == '__main__':
