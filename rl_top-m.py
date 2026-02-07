@@ -1,15 +1,21 @@
+import argparse
+import gc
+import json
+import logging
+import os
+import random
+import sqlite3
+
+import faiss
 import gymnasium as gym
 import numpy as np
-from gymnasium import spaces
-import argparse
 import torch
-import logging
+from gymnasium import spaces
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import os
-import sqlite3
-import faiss
-import json
+
 from utils import get_inference_system_prompt, get_inference_user_prompt, parse_generated_answer
 
 # 配置日志级别为INFO，输出到控制台
@@ -24,15 +30,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Top_M 的最大值 (Action 空间是 1 到 TOP_K)
 MAX_TOP_M = TOP_K
 
-# 由于 llm 很慢，我们只用少量数据
-N_TEST_CASES_FOR_RL = 100  # 只取前 n 笔 test data 来训练/测试 RL
-TOTAL_TIMESTEPS = 100  # RL 总共只训练 n 步 (即跑 n 次 RAG 流程)
+# 用少量数据测试
+TRAIN_DATA_SIZE = 100  # 只取前 n 笔 test data 来训练/测试 RL
 
 
-def load_test_data(test_path, qrels_path):
+def load_training_data(data_path, qrels_path):
     """
     Load test data from file.
-    :param test_path: test data path
+    :param data_path: test data path
     :param qrels_path: qrels path
     :return: tests
     """
@@ -46,8 +51,8 @@ def load_test_data(test_path, qrels_path):
         qid2gold[qid] = gold
 
     # Load test queries
-    tests = []
-    with open(test_path, "r", encoding="utf-8") as f:
+    data = []
+    with open(data_path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -59,24 +64,25 @@ def load_test_data(test_path, qrels_path):
 
             # 必须要有黄金答案才能计算reward
             if query and gold_answer:
-                tests.append({
+                data.append({
                     "qid": qid,
                     "query": query,
                     "gold_answer": gold_answer,
                     "gold_pids": gold_pids,
                 })
-    return tests
+    return data
+
 
 # Rouge-L (Chinese Safe)
 def lcs_length(a, b):
     n, m = len(a), len(b)
-    dp = [[0]*(m+1) for _ in range(n+1)]
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(n):
         for j in range(m):
             if a[i] == b[j]:
-                dp[i+1][j+1] = dp[i][j] + 1
+                dp[i + 1][j + 1] = dp[i][j] + 1
             else:
-                dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
+                dp[i + 1][j + 1] = max(dp[i][j + 1], dp[i + 1][j])
     return dp[n][m]
 
 
@@ -160,11 +166,12 @@ class RAGEnv(gym.Env):
     """
     metadata = {'render.modes': ['human', 'rgb_array']}
 
-    def __init__(self, args):
+    def __init__(self, args, mode="collect", offline_dataset=None):
         super(RAGEnv, self).__init__()
 
         self.args = args
         self.top_k = TOP_K
+        self.mode = mode
 
         # --- 1. Define Action and Observation Spaces ---
 
@@ -209,12 +216,18 @@ class RAGEnv(gym.Env):
         self.index = faiss.read_index(os.path.join(args.index_folder, args.index_file))
 
         # --- 4. Load Test Data ---
-        self.tests = load_test_data(args.test_file, args.qrels_file)
-        # 只使用一小部分数据
-        if N_TEST_CASES_FOR_RL > 0:
-            self.tests = self.tests[:N_TEST_CASES_FOR_RL]
-        logging.info(f"Loaded {len(self.tests)} test cases...")
-        self.current_test_index = 0
+        if self.mode == "collect":
+            self.train_data = load_training_data(args.train_file, args.qrels_file)
+            # 只使用一小部分数据
+            if TRAIN_DATA_SIZE > 0:
+                self.train_data = self.train_data[:TRAIN_DATA_SIZE]
+            logging.info(f"Loaded {len(self.train_data)} training samples...")
+            self.current_test_index = 0
+
+        if self.mode == "offline":
+            self.offline_dataset = offline_dataset
+            random.shuffle(self.offline_dataset)
+            self.offline_ptr = 0
 
         # 存储当前episode数据
         self.current_reranked_data = []
@@ -224,8 +237,8 @@ class RAGEnv(gym.Env):
 
     def _get_obs_and_reranked_data(self):
         # ---- 1. Random sample test case ----
-        idx = np.random.randint(0, len(self.tests))
-        test_case = self.tests[idx]
+        idx = np.random.randint(0, len(self.train_data))
+        test_case = self.train_data[idx]
 
         self.current_query = test_case["query"]
         self.current_gold_answer = test_case["gold_answer"]
@@ -338,16 +351,31 @@ class RAGEnv(gym.Env):
         return observation, info
 
     def step(self, action):
-        # ---- 1. Map Action ----
         top_m = int(action) + 1
 
-        # ---- 2. Select ----
+        # ---------------- OFFLINE MODE ----------------
+        if self.mode == "offline":
+            sample = self.offline_dataset[self.offline_ptr]
+            self.offline_ptr = (self.offline_ptr + 1) % len(self.offline_dataset)
+
+            reward = float(sample["reward"])
+            info = sample.get("info", {})
+
+            terminated = True
+            truncated = False
+
+            next_obs = sample.get("next_obs", sample["obs"])
+
+            return next_obs, reward, terminated, truncated, info
+
+        # ---------------- ONLINE COLLECT MODE ----------------
+        # ---- 1. Select ----
         if len(self.current_reranked_data) == 0:
             context_list = []
         else:
             context_list = [text for _, _, text in self.current_reranked_data[:top_m]]
 
-        # ---- 3. Generate ----
+        # ---- 2. Generate ----
         try:
             messages = [
                 {"role": "system", "content": get_inference_system_prompt()},
@@ -368,7 +396,6 @@ class RAGEnv(gym.Env):
 
             decoded = self.llm_tokenizer.batch_decode(outs, skip_special_tokens=True)
             pred_ans = parse_generated_answer(decoded[0].strip())
-
             if pred_ans.strip() == "":
                 pred_ans = " "
 
@@ -376,7 +403,7 @@ class RAGEnv(gym.Env):
             print("LLM generation failed:", e)
             pred_ans = " "
 
-        # ---- 4. Reward ----
+        # ---- 3. Reward ----
         try:
             reward, reward_info = compute_reward(
                 pred_ans=pred_ans,
@@ -394,7 +421,6 @@ class RAGEnv(gym.Env):
             reward = -0.5
             reward_info = {}
 
-        # ---- 5. Termination ----
         terminated = True
         truncated = False
 
@@ -406,14 +432,79 @@ class RAGEnv(gym.Env):
             "reward_info": reward_info
         }
 
-        # ---- 6. Next obs ----
-        # better: return same obs (bandit style) instead of zeros
-        next_obs = self.last_obs.copy() if hasattr(self, "last_obs") else np.zeros(self.top_k + 5, dtype=np.float32)
+        # ---- 4. Save Offline Transition ----
+        if hasattr(self, "offline_buffer"):
+            self.offline_buffer.append({
+                "obs": self.last_obs.copy(),
+                "action": action,
+                "reward": reward,
+                "next_obs": self.last_obs.copy(),
+                "info": info
+            })
+
+        next_obs = self.last_obs.copy()
 
         return next_obs, reward, terminated, truncated, info
 
     def close(self):
+        logging.info("Closing RAGEnv......")
+        self.conn.close()
+        del self.retriever, self.reranker, self.llm_model, self.llm_tokenizer, self.scorer
+        gc.collect()
+        torch.cuda.empty_cache()
 
+
+def collect_offline_dataset(env, save_path):
+    dataset = []
+
+    for _ in range(len(env.train_data)):
+        obs, _ = env.reset()
+
+        for m in range(env.top_k):
+            _, reward, _, _, info = env.step(m)
+
+            dataset.append({
+                "state": obs.tolist(),
+                "action": int(m),
+                "reward": float(reward),
+                "qid": info["qid"],
+                "top_m": m + 1
+            })
+
+    logging.info(f"Generated {len(dataset)} offline samples.")
+    with open(save_path, "w", encoding="utf-8") as f:
+        for data in dataset:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    logging.info(f"Generated offline samples saved to {save_path}.")
+
+
+def train(args):
+    logging.info("Offline PPO for RAG Top-M")
+
+    # -------- Phase 1: Collect --------
+    if not os.path.exists(args.rl_offline_data):
+        logging.info("[Phase1] Collecting offline dataset...")
+        env = RAGEnv(args, mode="collect")
+        collect_offline_dataset(env, args.rl_offline_data)
+        env.close()
+
+    # -------- Phase 2: Train --------
+    logging.info("[Phase2] Training PPO offline...")
+    env = DummyVecEnv([lambda: RAGEnv(args, mode="offline", offline_dataset=args.rl_offline_data)])
+
+    model = PPO(
+        "RAG_RL_Policy",
+        env,
+        verbose=1,
+        gamma=0.0,
+        learning_rate=3e-4,
+        n_steps=256,
+        batch_size=64,
+        ent_coef=0.01,
+    )
+
+    model.learn(total_timesteps=5000)
+    model.save(args.output_dir)
 
 
 if __name__ == '__main__':
@@ -424,12 +515,9 @@ if __name__ == '__main__':
                         help="Path to the train.txt JSONL file (must contain evidences/retrieval_labels).")
     parser.add_argument("--qrels_file", type=str, default="./data/qrels.txt",
                         help="Path to the qrels.txt JSON file (single object).")
-    parser.add_argument("--corpus_file", type=str, default="./data/corpus.txt",
-                        help="Path to the corpus.txt JSONL file.")
-    parser.add_argument("--test_file", type=str, default="./data/test_open.txt",
-                        help="Path to the test_open.txt file for evaluation.")
     parser.add_argument("--output_dir", type=str, default="./output/rl",
                         help="Directory to save the trained model.")
+    parser.add_argument("--rl_offline_data", type=str, default="./data/offline_rl.json")
 
     # Database paths
     parser.add_argument("--index_folder", type=str, default="./vector_database")
@@ -445,5 +533,9 @@ if __name__ == '__main__':
                         help="Path to the generator model.")
     parser.add_argument("--scoring_model", type=str, required=True,
                         help="Path to the scoring model.")
+
+    # Env mode
+    parser.add_argument("--mode", type=str, choices=["collect", "offline"], default="collect", required=True,
+                        help="Online Collect or Offline Train")
 
     args = parser.parse_args()
