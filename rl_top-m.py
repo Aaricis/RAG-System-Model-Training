@@ -18,6 +18,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from utils import get_inference_system_prompt, get_inference_user_prompt, parse_generated_answer
+from collections import defaultdict
 
 # 配置日志级别为INFO，输出到控制台
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -219,9 +220,8 @@ class RAGEnv(gym.Env):
         #   avg_ctx_len_norm
         # ]
         self.observation_space = spaces.Box(
-            low=-5.0, high=5.0, shape=(self.top_k + 5,), dtype=np.float32
+            low=-5.0, high=5.0, shape=(self.top_k + 6,), dtype=np.float32
         )
-        self.last_obs = None
 
         logging.info("Initializing RAGEnv...")
 
@@ -254,7 +254,7 @@ class RAGEnv(gym.Env):
             logging.info(f"Loaded {len(self.train_data)} training samples...")
             self.current_test_index = 0
 
-        if self.mode == "offline":
+        if self.mode == "train":
             self.offline_dataset = offline_dataset
             random.shuffle(self.offline_dataset)
             self.offline_ptr = 0
@@ -331,6 +331,7 @@ class RAGEnv(gym.Env):
         mu = scores.mean()
         std = scores.std() + 1e-6
         scores_norm = (scores - mu) / std
+        scores_norm = np.clip(scores_norm, -3, 3)
 
         # ---- 7. Gap + entropy ----
         gap12 = scores_norm[0] - scores_norm[1] if self.top_k > 1 else 0.0
@@ -338,6 +339,8 @@ class RAGEnv(gym.Env):
 
         p = np.exp(scores_norm - scores_norm.max())
         p = p / (p.sum() + 1e-8)
+        p = np.clip(p, 1e-8, None)
+
         entropy = -np.sum(p * np.log(p + 1e-8))
         entropy_norm = entropy / np.log(self.top_k + 1e-8)
 
@@ -363,10 +366,17 @@ class RAGEnv(gym.Env):
             MAX_CTX_LEN = 256
             avg_ctx_len_norm = min(avg_ctx, MAX_CTX_LEN) / MAX_CTX_LEN
 
+        if len(ctx_lens) > 2:
+            slope = np.mean(np.diff(ctx_lens[:5]))
+        else:
+            slope = 0.0
+
+        slope_norm = np.tanh(slope / 50)
+
         # ---- 10. Final Observation ----
         obs = np.concatenate([
             scores_norm,
-            [gap12_norm, gap1k_norm, entropy_norm, query_len_norm, avg_ctx_len_norm]
+            [gap12_norm, gap1k_norm, entropy_norm, query_len_norm, avg_ctx_len_norm, slope_norm]
         ]).astype(np.float32)
 
         return obs
@@ -421,7 +431,7 @@ class RAGEnv(gym.Env):
             tokenizer=self.llm_tokenizer,
             w_cos=0.6,
             w_rouge=0.4,
-            lambda_cost=0.0005
+            lambda_cost=0.2
         )
 
         return reward, reward_info, pred_ans
@@ -431,23 +441,23 @@ class RAGEnv(gym.Env):
 
         observation = self._get_obs_and_reranked_data()
         info = {}
-        self.last_obs = observation.copy()
 
         return observation, info
 
     def step(self, action):
-        if self.mode == "offline":
+        if self.mode == "train":
             sample = self.offline_dataset[self.offline_ptr]
             self.offline_ptr = (self.offline_ptr + 1) % len(self.offline_dataset)
 
             obs = np.array(sample["state"], dtype=np.float32)
-            action = int(sample["action"])
+            next_obs = np.array(sample["next_state"])
+
             reward = float(sample["reward"])
 
             terminated = True
             truncated = False
 
-            return obs, reward, terminated, truncated, {}
+            return next_obs, reward, terminated, truncated, {}
 
     def close(self):
         logging.info("Closing RAGEnv......")
@@ -475,6 +485,8 @@ def collect_offline_dataset(env, save_path):
                 "state": state,
                 "action": int(m),
                 "reward": float(reward),
+                "next_state": state,
+                "done": True,
                 "qid": env.current_qid,
                 "top_m": m + 1,
                 "reward_info": reward_info,
@@ -483,13 +495,18 @@ def collect_offline_dataset(env, save_path):
 
     logging.info(f"Generated {len(dataset)} offline samples.")
 
-    # reward normalization
+    # reward normalize per-query
     # PPO 非常吃 reward scale
-    rewards = [x["reward"] for x in dataset]
-    mu, std = np.mean(rewards), np.std(rewards)
 
+    by_qid = defaultdict(list)
     for x in dataset:
-        x["reward"] = (x["reward"] - mu) / (std + 1e-6)
+        by_qid[x["qid"]].append(x)
+
+    for qid, items in by_qid.items():
+        rs = [i["reward"] for i in items]
+        mu, std = np.mean(rs), np.std(rs) + 1e-6
+        for i in items:
+            i["reward"] = (i["reward"] - mu) / std
 
     with open(save_path, "w", encoding="utf-8") as f:
         for data in dataset:
@@ -521,14 +538,15 @@ def train(args):
             verbose=1,
             gamma=1.0,
             gae_lambda = 1.0,
-            learning_rate=1e-4,
-            n_steps=128,
-            batch_size=128,
-            ent_coef=0.02,
+            learning_rate=5e-4,
+            n_steps=64,
+            batch_size=64,
+            ent_coef=0.05,
             clip_range=0.2,
+            vf_coef=0.1
         )
 
-        model.learn(total_timesteps=5000)
+        model.learn(total_timesteps=30000)
         model.save(args.output_dir)
         logging.info(f"RL model saved to {args.output_dir}")
 
@@ -561,7 +579,14 @@ if __name__ == '__main__':
                         help="Path to the scoring model.")
 
     # Env mode
-    parser.add_argument("--mode", type=str, choices=["collect", "offline"], default="collect", required=True,
+    parser.add_argument("--mode", type=str, choices=["collect", "train"], default="collect", required=True,
                         help="Online Collect or Offline Train")
 
     args = parser.parse_args()
+
+    # 固定seed
+    np.random.seed(42)
+    torch.manual_seed(42)
+    random.seed(42)
+
+    train(args)
