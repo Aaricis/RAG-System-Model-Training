@@ -23,6 +23,11 @@ from collections import defaultdict
 # 配置日志级别为INFO，输出到控制台
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+# 固定seed
+np.random.seed(42)
+torch.manual_seed(42)
+random.seed(42)
+
 # --- RAG Parameters ---
 TOP_K = 10  # Retriever 檢索 K 篇
 GEN_MAXLEN = 1280
@@ -153,9 +158,9 @@ def compute_reward(
     conf = np.tanh(len(pred_ans) / 50)
 
     quality = (
-        w_cos * cos_norm +
-        w_rouge * rouge +
-        0.1 * conf
+            w_cos * cos_norm +
+            w_rouge * rouge +
+            0.1 * conf
     )
     quality = np.clip(quality, 0, 1)
 
@@ -184,7 +189,6 @@ def compute_reward(
         "cost": cost,
         "m_penalty": m_penalty
     }
-
 
 
 class RAGEnv(gym.Env):
@@ -218,6 +222,7 @@ class RAGEnv(gym.Env):
         #   entropy_norm,
         #   query_len_norm,
         #   avg_ctx_len_norm
+        #   slope_norm
         # ]
         self.observation_space = spaces.Box(
             low=-5.0, high=5.0, shape=(self.top_k + 6,), dtype=np.float32
@@ -467,18 +472,25 @@ class RAGEnv(gym.Env):
         torch.cuda.empty_cache()
 
 
-def collect_offline_dataset(env, save_path):
+def collect_offline_dataset(env, save_path, n_queries=8000):
     dataset = []
 
-    for _ in range(len(env.train_data)):
-        # ---- reset: retrieve + rerank once ----
+    for _ in range(n_queries):
         obs, _ = env.reset()
-
-        # cache obs
         state = obs.tolist()
 
-        # ---- evaluate all Top_M on same retrieval ----
-        for m in range(env.top_k):
+        best = -1e9
+        drop = 0
+
+        # ---- mixed exploration ----
+        base = list(range(min(3, env.top_k)))
+        rest = list(range(3, env.top_k))
+        random.shuffle(rest)
+        ms = sorted(base + rest[:2])  # total ~5 固定 3 个 + 随机 2 个 = 5 个索引
+
+        min_m = 2
+
+        for m in ms:
             reward, reward_info, pred_ans = env.evaluate_action(m)
 
             dataset.append({
@@ -493,18 +505,30 @@ def collect_offline_dataset(env, save_path):
                 "pred_ans": pred_ans
             })
 
+            # ---- early stop ----
+            if reward > best + 0.01:
+                best = reward
+                drop = 0
+            else:
+                drop += 1
+
+            if (m + 1) >= min_m and drop >= 2:
+                break
+
     logging.info(f"Generated {len(dataset)} offline samples.")
 
-    # reward normalize per-query
-    # PPO 非常吃 reward scale
-
+    # ---- per-query reward normalize ----
     by_qid = defaultdict(list)
     for x in dataset:
         by_qid[x["qid"]].append(x)
 
     for qid, items in by_qid.items():
         rs = [i["reward"] for i in items]
-        mu, std = np.mean(rs), np.std(rs) + 1e-6
+        mu = float(np.mean(rs))
+        std = float(np.std(rs))
+        if std < 1e-6:
+            std = 1.0
+
         for i in items:
             i["reward"] = (i["reward"] - mu) / std
 
@@ -537,7 +561,7 @@ def train(args):
             env,
             verbose=1,
             gamma=1.0,
-            gae_lambda = 1.0,
+            gae_lambda=1.0,
             learning_rate=5e-4,
             n_steps=64,
             batch_size=64,
@@ -583,10 +607,5 @@ if __name__ == '__main__':
                         help="Online Collect or Offline Train")
 
     args = parser.parse_args()
-
-    # 固定seed
-    np.random.seed(42)
-    torch.manual_seed(42)
-    random.seed(42)
 
     train(args)
