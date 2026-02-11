@@ -6,6 +6,7 @@ import os
 import random
 import sqlite3
 import sys
+import time
 
 import faiss
 import gymnasium as gym
@@ -38,7 +39,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_TOP_M = TOP_K
 
 # 用少量数据测试
-TRAIN_DATA_SIZE = 100  # 只取前 n 笔 test data 来训练/测试 RL
+TRAIN_DATA_SIZE = -1  # 只取前 n 笔 test data 来训练/测试 RL
 
 
 def load_training_data(data_path: str, qrels_path: str):
@@ -137,7 +138,8 @@ def rouge_l_f1(pred, gold):
 def compute_reward(
         pred_ans: str,
         gold_ans: str,
-        reranked_data,
+        gold_emb,
+        ctx_token_lens,
         top_m: int,
         scorer,
         tokenizer,
@@ -145,40 +147,36 @@ def compute_reward(
         w_rouge=0.4,
         lambda_cost=0.2,
 ):
-    # -------- Semantic --------
-    emb_res = scorer.encode([pred_ans], convert_to_tensor=True, normalize_embeddings=True)
-    emb_gold = scorer.encode([gold_ans], convert_to_tensor=True, normalize_embeddings=True)
-    cos = util.cos_sim(emb_res, emb_gold)[0][0].item()
+    # -------- semantic (cosine) --------
+    emb_pred = scorer.encode(
+        [pred_ans],
+        convert_to_tensor=True,
+        normalize_embeddings=True
+    )
+
+    cos = util.cos_sim(emb_pred, gold_emb)[0][0].item()
     cos_norm = (cos + 1) / 2
 
-    # -------- Lexical --------
+    # -------- rouge-l (Chinese) --------
     rouge = rouge_l_f1(pred_ans, gold_ans)
 
-    # -------- Confidence --------
+    # -------- confidence --------
     conf = np.tanh(len(pred_ans) / 50)
 
-    quality = (
-            w_cos * cos_norm +
-            w_rouge * rouge +
-            0.1 * conf
-    )
-    quality = np.clip(quality, 0, 1)
-
-    # -------- Token Cost --------
-    ctx_tokens = sum(
-        len(tokenizer.encode(t, add_special_tokens=False))
-        for _, _, t in reranked_data[:top_m]
+    quality = np.clip(
+        w_cos * cos_norm + w_rouge * rouge + 0.1 * conf,
+        0.0,
+        1.0
     )
 
+    # -------- token cost (cached) --------
+    ctx_tokens = sum(ctx_token_lens[:top_m])
     cost = np.tanh(ctx_tokens / 800)
 
-    # -------- Marginal M Penalty --------
+    # -------- marginal M penalty --------
     m_penalty = 0.01 * top_m
 
-    # -------- Final --------
     reward = quality - lambda_cost * cost - m_penalty
-
-    # -------- PPO Safe --------
     reward = float(np.tanh(reward))
 
     return reward, {
@@ -204,6 +202,8 @@ class RAGEnv(gym.Env):
     def __init__(self, args, mode="collect", offline_dataset=None):
         super(RAGEnv, self).__init__()
 
+        self.ctx_token_lens = None
+        self.current_gold_emb = None
         self.args = args
         self.top_k = TOP_K
         self.mode = mode
@@ -269,6 +269,9 @@ class RAGEnv(gym.Env):
         self.current_query = ""
         self.current_gold_answer = ""
         self.current_qid = ""
+
+        self.llm_model.eval()
+        self.llm_model = torch.compile(self.llm_model)  # ✅ torch.compile
 
     def _get_obs_and_reranked_data(self):
         # ---- 1. Random sample test case ----
@@ -386,68 +389,92 @@ class RAGEnv(gym.Env):
 
         return obs
 
-    def evaluate_action(self, action):
+    # ------------------------------------------------
+    # batch evaluate actions (TOP_M)
+    # ------------------------------------------------
+    @torch.no_grad()
+    def batch_evaluate_actions(self, actions):
         """
-        Evaluate Top_M without changing episode state.
-        Used only for offline dataset collection.
+        actions: List[int], 0-based
+        return: List[(reward, reward_info, pred_ans)]
         """
-        top_m = int(action) + 1
+        top_ms = [a + 1 for a in actions]
 
-        if len(self.current_reranked_data) == 0:
-            context_list = []
-        else:
-            context_list = [text for _, _, text in self.current_reranked_data[:top_m]]
+        # ---- build batched prompts ----
+        prompts = []
+        for top_m in top_ms:
+            ctx = [t for _, _, t in self.current_reranked_data[:top_m]]
 
-        # ---- Generate ----
-        try:
             messages = [
                 {"role": "system", "content": get_inference_system_prompt()},
-                {"role": "user", "content": get_inference_user_prompt(self.current_query, context_list)}
+                {"role": "user", "content": get_inference_user_prompt(self.current_query, ctx)}
             ]
 
             self.llm_tokenizer.padding_side = "left"
-            rendered_prompt = self.llm_tokenizer.apply_chat_template(
+            rendered = self.llm_tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             )
+            prompts.append(rendered)
 
-            inputs = self.llm_tokenizer(
-                [rendered_prompt], padding=True, return_tensors="pt"
-            ).to(self.llm_model.device)
+        inputs = self.llm_tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt"
+        ).to(self.llm_model.device)
 
-            with torch.no_grad():
-                outs = self.llm_model.generate(**inputs, max_new_tokens=GEN_MAXLEN)
+        outs = self.llm_model.generate(
+            **inputs,
+            max_new_tokens=GEN_MAXLEN,
+            do_sample=False
+        )
 
-            decoded = self.llm_tokenizer.batch_decode(outs, skip_special_tokens=True)
-            pred_ans = parse_generated_answer(decoded[0].strip())
+        decoded = self.llm_tokenizer.batch_decode(
+            outs, skip_special_tokens=True
+        )
+
+        # ---- compute rewards ----
+        results = []
+        for i, text in enumerate(decoded):
+            pred_ans = parse_generated_answer(text.strip())
             if pred_ans.strip() == "":
                 pred_ans = " "
 
-        except Exception as e:
-            print("LLM generation failed:", e)
-            pred_ans = " "
+            reward, reward_info = compute_reward(
+                pred_ans=pred_ans,
+                gold_ans=self.current_gold_answer,
+                gold_emb=self.current_gold_emb,  # ✅ cached
+                ctx_token_lens=self.ctx_token_lens,  # ✅ cached
+                top_m=top_ms[i],
+                scorer=self.scorer,
+                tokenizer=self.llm_tokenizer
+            )
 
-        # ---- Reward ----
-        reward, reward_info = compute_reward(
-            pred_ans=pred_ans,
-            gold_ans=self.current_gold_answer,
-            reranked_data=self.current_reranked_data,
-            top_m=top_m,
-            scorer=self.scorer,
-            tokenizer=self.llm_tokenizer,
-            w_cos=0.6,
-            w_rouge=0.4,
-            lambda_cost=0.2
-        )
+            results.append((reward, reward_info, pred_ans))
 
-        return reward, reward_info, pred_ans
+        return results
 
-    def reset(self, seed=None, options=None):
+    # ------------------------------------------------
+    # reset(): retrieve + rerank + cache everything
+    # ------------------------------------------------
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        observation = self._get_obs_and_reranked_data()
-        info = {}
+        obs = self._get_obs_and_reranked_data()
 
-        return observation, info
+        # ✅ cache gold embedding
+        self.current_gold_emb = self.scorer.encode(
+            [self.current_gold_answer],
+            convert_to_tensor=True,
+            normalize_embeddings=True
+        )
+
+        # ✅ cache ctx token length
+        self.ctx_token_lens = [
+            len(self.llm_tokenizer.encode(t, add_special_tokens=False))
+            for _, _, t in self.current_reranked_data
+        ]
+
+        return obs, {}
 
     def step(self, action):
         if self.mode == "train":
@@ -473,26 +500,37 @@ class RAGEnv(gym.Env):
 
 
 def collect_offline_dataset(env, save_path, n_queries=8000):
+    logging.info(f"Start to collect {n_queries} queries.")
+    start = time.time()
+
     dataset = []
 
     for _ in range(n_queries):
         obs, _ = env.reset()
         state = obs.tolist()
 
-        best = -1e9
-        drop = 0
-
-        # ---- mixed exploration ----
+        # ---------- candidate M selection ----------
         base = list(range(min(3, env.top_k)))
         rest = list(range(3, env.top_k))
         random.shuffle(rest)
-        ms = sorted(base + rest[:2])  # total ~5 固定 3 个 + 随机 2 个 = 5 个索引
+        ms = sorted(base + rest[:2])  # ~5
 
-        min_m = 2
-
+        # ---------- cheap proxy filter ----------
+        proxy_scores = []
         for m in ms:
-            reward, reward_info, pred_ans = env.evaluate_action(m)
+            scores = [s for s, _, _ in env.current_reranked_data[:m + 1]]
+            proxy_scores.append(np.mean(scores))
 
+        top_ids = np.argsort(proxy_scores)[-3:]
+        ms = [ms[i] for i in top_ids]
+
+        # ---------- batch LLM ----------
+        results = env.batch_evaluate_actions(ms)
+
+        best = -1e9
+        drop = 0
+
+        for m, (reward, info, pred_ans) in zip(ms, results):
             dataset.append({
                 "state": state,
                 "action": int(m),
@@ -501,23 +539,21 @@ def collect_offline_dataset(env, save_path, n_queries=8000):
                 "done": True,
                 "qid": env.current_qid,
                 "top_m": m + 1,
-                "reward_info": reward_info,
+                "reward_info": info,
                 "pred_ans": pred_ans
             })
 
-            # ---- early stop ----
+            # early stop
             if reward > best + 0.01:
                 best = reward
                 drop = 0
             else:
                 drop += 1
 
-            if (m + 1) >= min_m and drop >= 2:
+            if (m + 1) >= 2 and drop >= 2:
                 break
 
-    logging.info(f"Generated {len(dataset)} offline samples.")
-
-    # ---- per-query reward normalize ----
+    # ---------- per-query reward normalize ----------
     by_qid = defaultdict(list)
     for x in dataset:
         by_qid[x["qid"]].append(x)
@@ -528,16 +564,17 @@ def collect_offline_dataset(env, save_path, n_queries=8000):
         std = float(np.std(rs))
         if std < 1e-6:
             std = 1.0
-
         for i in items:
             i["reward"] = (i["reward"] - mu) / std
 
     with open(save_path, "w", encoding="utf-8") as f:
-        for data in dataset:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        for x in dataset:
+            f.write(json.dumps(x, ensure_ascii=False) + "\n")
 
-    logging.info(f"Generated offline samples saved to {save_path}.")
+    logging.info(f"Offline dataset saved to {save_path}, size={len(dataset)}")
 
+    end = time.time()
+    logging.info(f"耗时: {end - start:.4f} 秒")
 
 def train(args):
     logging.info("Offline PPO for RAG Top-M")
@@ -546,7 +583,7 @@ def train(args):
     if args.mode == "collect":
         logging.info("Collecting offline dataset...")
         env = RAGEnv(args, mode="collect")
-        collect_offline_dataset(env, args.rl_offline_data)
+        collect_offline_dataset(env, args.rl_offline_data, n_queries=args.n_queries)
         env.close()
 
     elif args.mode == "train":
@@ -567,7 +604,8 @@ def train(args):
             batch_size=64,
             ent_coef=0.05,
             clip_range=0.2,
-            vf_coef=0.1
+            vf_coef=0.1,
+            tensorboard_log="./output/rl/ppo/runs"
         )
 
         model.learn(total_timesteps=30000)
@@ -585,7 +623,8 @@ if __name__ == '__main__':
                         help="Path to the qrels.txt JSON file (single object).")
     parser.add_argument("--output_dir", type=str, default="./output/rl",
                         help="Directory to save the trained model.")
-    parser.add_argument("--rl_offline_data", type=str, default="./data/offline_rl.json")
+    parser.add_argument("--rl_offline_data", type=str, default="./data/offline_rl.jsonl")
+    parser.add_argument("--n_queries", type=int, default=8000)
 
     # Database paths
     parser.add_argument("--index_folder", type=str, default="./vector_database")
