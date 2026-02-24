@@ -7,6 +7,7 @@ import random
 import sqlite3
 import sys
 import time
+from collections import defaultdict
 
 import faiss
 import gymnasium as gym
@@ -15,11 +16,9 @@ import torch
 from gymnasium import spaces
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from utils import get_inference_system_prompt, get_inference_user_prompt, parse_generated_answer
-from collections import defaultdict
 
 # 配置日志级别为INFO，输出到控制台
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -576,6 +575,81 @@ def collect_offline_dataset(env, save_path, n_queries=8000):
     end = time.time()
     logging.info(f"耗时: {end - start:.4f} 秒")
 
+class OfflineBanditEnv(gym.Env):
+    """
+        1-step Offline Contextual Bandit Environment
+        Designed for PPO training
+    """
+
+    def __init__(self, offline_dataset):
+        super().__init__()
+
+        # -------- Build index --------
+        self.qid_to_state = {}
+        self.qid_to_action_reward = defaultdict(dict)
+
+        for item in offline_dataset:
+            qid = item["qid"]
+            state = np.array(item["state"], dtype=np.float32)
+            action = int(item["action"])
+            reward = float(item["reward"])
+
+            self.qid_to_state[qid] = state
+            self.qid_to_action_reward[qid][action] = reward
+
+        self.qids = list(self.qid_to_state.keys())
+
+        # -------- Spaces --------
+        example_state = next(iter(self.qid_to_state.values()))
+        self.state_dim = len(example_state)
+        self.action_dim = max(
+            max(actions.keys()) for actions in self.qid_to_action_reward.values()
+        ) + 1
+
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.state_dim,),
+            dtype=np.float32
+        )
+
+        self.action_space = spaces.Discrete(self.action_dim)
+
+        # current episode state
+        self.current_qid = None
+        self.current_state = None
+
+    # --------------------------------
+    # reset()
+    # --------------------------------
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        self.current_qid = random.choice(self.qids)
+        self.current_state = self.qid_to_state[self.current_qid]
+
+        return self.current_state, {}
+
+    # --------------------------------
+    # step()
+    # --------------------------------
+    def step(self, action):
+        action = int(action)
+
+        # lookup reward
+        reward = self.qid_to_action_reward[self.current_qid].get(action, 0.0)
+
+        terminated = True
+        truncated = False
+
+        info = {
+            "qid": self.current_qid,
+            "selected_action": action,
+        }
+
+        return self.current_state, reward, terminated, truncated, info
+
+
 def train(args):
     logging.info("Offline PPO for RAG Top-M")
 
@@ -590,25 +664,21 @@ def train(args):
         # -------- Phase 2: Train --------
         logging.info("Training PPO offline...")
         offline_dataset = load_offline_data(args.rl_offline_data)
-        env = DummyVecEnv([lambda: RAGEnv(args, mode="offline", offline_dataset=offline_dataset)])
+        env = OfflineBanditEnv(offline_dataset)
 
         # Contextual Bandit PPO
         model = PPO(
             "MlpPolicy",
             env,
+            learning_rate=3e-4,
+            gamma=0.0,  # single step bandit
+            n_steps=2048,
+            batch_size=256,
             verbose=1,
-            gamma=1.0,
-            gae_lambda=1.0,
-            learning_rate=5e-4,
-            n_steps=64,
-            batch_size=64,
-            ent_coef=0.05,
-            clip_range=0.2,
-            vf_coef=0.1,
             tensorboard_log="./output/rl/ppo/runs"
         )
 
-        model.learn(total_timesteps=30000)
+        model.learn(total_timesteps=100000)
         model.save(args.output_dir)
         logging.info(f"RL model saved to {args.output_dir}")
 
@@ -632,13 +702,13 @@ if __name__ == '__main__':
     parser.add_argument("--sqlite_file", type=str, default="passage_store.db")
 
     # Model paths
-    parser.add_argument("--retriever_model_path", type=str, required=True,
+    parser.add_argument("--retriever_model_path", type=str,
                         help="Path to retriever model.")
-    parser.add_argument("--reranker_model_path", type=str, required=True,
+    parser.add_argument("--reranker_model_path", type=str,
                         help="Path to the reranker model.")
-    parser.add_argument("--generator_model", type=str, required=True,
+    parser.add_argument("--generator_model", type=str,
                         help="Path to the generator model.")
-    parser.add_argument("--scoring_model", type=str, required=True,
+    parser.add_argument("--scoring_model", type=str,
                         help="Path to the scoring model.")
 
     # Env mode
