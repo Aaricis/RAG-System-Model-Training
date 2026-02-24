@@ -97,7 +97,7 @@ def prepare_train_examples(args):
 
 def prepare_train_examples_for_lambda_loss(args):
     """
-    Parses the train dataset for RankNetLoss
+    Parses the train dataset for LambdaLoss
     :param args: 参数
     :return: Dataset
     """
