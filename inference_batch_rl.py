@@ -43,7 +43,7 @@ qrels_path = args.qrels_path
 result_file = args.result_file_name
 
 # Set OMP_NUM_THREADS to a valid number
-os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 ###############################################################################
 # 0. parameters
@@ -462,12 +462,20 @@ final["top_m_stats"] = stats
 with open(result_file_path, "w", encoding="utf-8") as f:
     json.dump(final, f, indent=2, ensure_ascii=False)
 
-if len(top_m_values) > 0:
-    xs = sorted(top_m_counter.keys())
-    ys = [top_m_counter[x] for x in xs]
-    plt.bar(xs, ys)
-    plt.xlabel("top_m")
-    plt.ylabel("count")
-    plt.title("Distribution of PPO selected top_m")
-    plt.savefig("./output/top_m_hist.png", dpi=200)
-    plt.close()
+xs = sorted(top_m_counter.keys())
+ys = [top_m_counter[x] for x in xs]
+
+plt.figure(figsize=(6, 4))
+plt.bar(xs, ys, color='C0', alpha=0.9)
+plt.xlabel("top_m")
+plt.ylabel("count")
+plt.title("Distribution of PPO selected top_m")
+plt.xticks(xs)
+# 在柱上标注数值
+for x, y in zip(xs, ys):
+    plt.text(x, y + max(ys) * 0.01, str(y), ha='center', va='bottom', fontsize=9)
+
+os.makedirs("results", exist_ok=True)
+plt.tight_layout()
+plt.savefig("./output/top_m_hist.png", dpi=200)
+plt.close()
