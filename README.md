@@ -16,7 +16,16 @@ All components (Retriever, Reranker, and Generator prompts) have been fine-tuned
 **详细实验过程和分析参见:**
 - [我的博客](https://aaricis.github.io/posts/RAG-System-Model-Training/)
 
-- [zhihu专栏](https://zhuanlan.zhihu.com/p/2011104267331724732)
+- [Zhihu专栏](https://zhuanlan.zhihu.com/p/2011104267331724732)
+
+## Model & Dataset Download
+
+Fine-tuned retriever, reranker models and dataset can be downloaded from the following links.
+
+- Retriever: [intfloat/multilingual-e5-small微调](https://www.modelscope.cn/models/TaitaiPhu/intfloat_multilingual_e5_small_finetune)
+- Reranker: [cross-encoder/ms-marco-MiniLM-L12-v2模型微调](https://www.modelscope.cn/models/TaitaiPhu/cross_encoder_ms_marco_MiniLM_L12_v2_fine)
+- PPO Model: [RAG系统top_m推理](https://www.modelscope.cn/models/TaitaiPhu/RL-RAG-TOP_M-infer)
+- Dataset: [RAG系统模型训练](https://www.modelscope.cn/datasets/TaitaiPhu/RAG-System-Model-Training)
 
 ## Quick Test
 Download the pre-trained models and dataset from gdown and unzip them:
@@ -151,6 +160,7 @@ Use **Reinforcement Learning** to train a model deciding the number of passages 
         --reranker_model_path <reranker model path> \
         --rl_model_path ./output/rl.zip
     ```
+  
 ## 免责声明 | Disclaimer
 
 本项目仅供学习和研究使用。使用者须遵守当地的法律法规，包括但不限于 DMCA 相关法律。我们不对任何非法使用承担责任。
