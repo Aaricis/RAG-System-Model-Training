@@ -4,126 +4,155 @@
 This project implements a complete, high-performance Retrieval-Augmented Generation (RAG) pipeline. It uses a "Retrieve-then-Rerank" two-stage process to find relevant context, which is then fed to a generative language model to produce an answer.
 
 All components (Retriever, Reranker, and Generator prompts) have been fine-tuned and optimized on a custom Q&A dataset to achieve high scores across retrieval and generation metrics.
-## 数据集简介
-本数据集用于微调RAG系统retriever、reranker模型，以及离线训练强化学习策略。
 
-数据集主要提供构建RAG系统所需的query、passage raw data，以及它们的对应关系，分为训练集和测试集供微调模型使用。
+## Results
 
-另外还包括自己采集的hard negative数据，用于reranker模型优化。以及自行构建的强化学习离线训练数据集。
+| 模型         | Recall@10 | MRR@10 (after rerank) | Bi-Encoder CosSim |
+| ------------ | --------- | --------------------- | ----------------- |
+| Base         | 0.8172    | 0.7240                | 0.3656            |
+| Fine tune    | 0.8549    | 0.7737                | 0.3725            |
+| RL-RAG-TOP-M | 0.8549    | 0.7737                | 0.3702            |
 
-## 数据格式与规范
-- Corpus: passages to be retrieved
+**详细实验过程和分析参见:**
+- [我的博客](https://aaricis.github.io/posts/RAG-System-Model-Training/)
 
-  ```json
-  {
-      "text": "...",
-      "title": "...",
-      "aid": "25749059",
-      "bid": 5,
-      "id": "25749059@5"
-  }
-  ```
+- [zhihu专栏](https://zhuanlan.zhihu.com/p/2011104267331724732)
 
-- qrels: mappings of queries and their positive passages
-
-  ```json
-  {
-      "qid1":{
-          "passageId": 1
-      }
-  }
-  ```
-
-- Each query has a specific positive passage
-
-- train / test_open: train and public test data
-
-  ```json
-  {
-      "qid": "...",
-      "rewrite": "...",
-      "evidences": [],
-       "answer": {
-           "text": "",
-           "answer_start": 0
-       },
-      "retrieval_labels": [0, 0, 0, 0, 1]
-  }
-  ```
-
-   - 	rewrite: query content;
-   - 	evidences: passages from BM25 negative sampling;
-   - 	retrieval_labels: corresponding true/false label for passages in "evidences";
-  
-- The answer can be <u>an exact span of positive passage</u> or <u>CANNOTANSWER</u> in both train and test data;
-
-- There can be no positive passage in "evidences" column in `test_open.txt`, however, you can find the positive passage id in `qrels.txt`.
-
-
-- reranker_train_hard_neg_*.jsonl: hard negative mining
-
-```json
-{
-  "query": "Where is Malayali located?",
-  "passage": "According to the Indian census of 2001, there were 30,803,747 speakers of Malayalam in Kerala, making up 93.2% of the total number of Malayalam speakers in India, and 96.7% of the total population of the state. There were a further 701,673 (2.1% of the total number) in Karnataka, 557,705 (1.7%) in Tamil Nadu and 406,358 (1.2%) in Maharashtra. The number of Malayalam speakers in Lakshadweep is 51,100, which is only 0.15% of the total number, but is as much as about 84% of the population of Lakshadweep. In all, Malayalis made up 3.22% of the total Indian population in 2001. Of the total 33,066,392 Malayalam speakers in India in 2001, 33,015,420 spoke the standard dialects, 19,643 spoke the Yerava dialect and 31,329 spoke non-standard regional variations like Eranadan. As per the 1991 census data, 28.85% of all Malayalam speakers in India spoke a second language and 19.64% of the total knew three or more languages. Large numbers of Malayalis have settled in Bangalore, Mangalore, Delhi, Coimbatore, Hyderabad, Mumbai (Bombay), Ahmedabad, Pune, and Chennai (Madras). A large number of Malayalis have also emigrated to the Middle East, the United States, and Europe. Accessed November 22, 2014.</ref> including a large number of professionals. There were 7,093 Malayalam speakers in Australia in 2006. The 2001 Canadian census reported 7,070 people who listed Malayalam as their mother tongue, mostly in the Greater Toronto Area and Southern Ontario.",
-  "label": 1
-}
+## Quick Test
+Download the pre-trained models and dataset from gdown and unzip them:
+```shell
+bash download.sh
 ```
-
-- offline_rl_query_3000.jsonl: reinforcement learning offline training data
-```json
-{
-  "state": [
-    1.4911106824874878,
-    0.9573036432266235,
-    0.7595851421356201,
-    0.3282075524330139,
-    0.2760377526283264,
-    -0.06384341418743134,
-    -0.4320544898509979,
-    -0.4342767298221588,
-    -0.5559507608413696,
-    -2.326120138168335,
-    0.4882858395576477,
-    0.9990334510803223,
-    0.8651432991027832,
-    0.078125,
-    1,
-    -0.12435299903154373
-  ],
-  "action": 2,
-  "reward": -0.5155330705185974,
-  "next_state": [
-    1.4911106824874878,
-    0.9573036432266235,
-    0.7595851421356201,
-    0.3282075524330139,
-    0.2760377526283264,
-    -0.06384341418743134,
-    -0.4320544898509979,
-    -0.4342767298221588,
-    -0.5559507608413696,
-    -2.326120138168335,
-    0.4882858395576477,
-    0.9990334510803223,
-    0.8651432991027832,
-    0.078125,
-    1,
-    -0.12435299903154373
-  ],
-  "done": true,
-  "qid": "C_191f92ba623c40e7b707183a363a4319_1_q#3",
-  "top_m": 3,
-  "reward_info": {
-    "cosine": 0.7714184522628784,
-    "rouge_l": 0.2755905511594023,
-    "ctx_tokens": 1126,
-    "quality": 0.6730546397149744,
-    "cost": 0.886962068040758,
-    "m_penalty": 0.03
-  },
-  "pred_ans": "Yes, the Eagles toured. They performed multiple tours, including the Hell Freezes Over Tour (1994-1996) and the Long Road Out of Eden Tour. They also reunited in 1994 and had subsequent tours without Leadon or Meisner."
-}
+Create `.env` at `./`:
+```text
+hf_token=YOUR_HUGGING_FACE_TOKEN
 ```
+To quickly test the end-to-end pipeline with pre-trained models, run the following commands:
+```shell
+python save_embeddings.py --retriever_model_path ./models/retriever --build_db
 
-## 数据集清单
+python inference_batch.py --retriever_model_path ./models/retriever --reranker_model_path ./models/reranker --test_data_path ./data/test_open.txt
+```
+## Project Architecture
+The pipeline consists of three main components:
+1. Retriever(Bi-Encoder):
+    - Model: `intfloat/multilingual-e5-small`
+    - Task: Performing a fast, broad search over the entire corpus. It is fine-tuned on `(anchor, positive, negative_1, …, negative_n)` using `MultipleNegativesRankingLoss` to excel at finding relevant passages.
+2. Reranker(Cross-Encoder):
+    - Model: `cross-encoder/ms-marco-MiniLM-L12-v2`
+    - Task: Taking the Top-K passages from the retriever and re-scores them with high precision. It is fine-tuned on a "hard-negative" dataset, where the negatives are passages that the retriever thought were quite good, forcing the reranker to learn fine-grained distinctions.
+3. Generator(LLM):
+    - Model: `Qwen/Qwen3-1.7B`
+    - Task: Received the Top-M reranked passages and generates a final answer. Its performance is highly dependent on a "Natural Q&A" prompt provided in `utils.py`.
+
+## Setup & Installation
+1. Clone the repository and create a virtual environment with Python 3.12:
+    ```shell
+    git clone https://github.com/Aaricis/RAG-System-Model-Training.git
+    cd RAG-System-Model-Training
+    conda create -n <env_name> python=3.12
+    conda activate <env_name>
+    ```
+2. Install dependencies:
+    ```shell
+    pip install -r requirements.txt
+    ```
+3. Hugging Face Login:
+Create a `.env` file in the root directory and your Hugging Face token (required by `inference_batch.py`)
+    ```text
+    hf_token=YOUR_HUGGING_FACE_TOKEN
+    ```
+4. Dataset: 
+Ensure your data files (train.txt, test_open.txt, corpus.txt, qrels.txt) are located in the `./data/` directory.
+
+## Workflow & Usage
+The "Retrieve-then-Rerank" pipeline must be trained in order.
+- Step 1: Fine-Tune the Retriever
+
+    This script trains the bi-encoder model on the `(anchor, positive, negative_1, …, negative_n)` found in `train.txt`.
+    ```shell
+    python finetune_retriever.py \
+        --epochs 3 \
+        --batch_size 32 \
+        --grad_accumulate_step 4 \
+        --learning_rate 2e-5 \
+        --eval_batch_size 128 \
+        --eval_steps 200
+    ```
+- Step 2: Build the Vector Database
+    
+    The `inference_batch.py` script requires a pre-built FAISS index and SQLite database. Using `save_embeddings.py` to create these using the fine-tuned retriever from Step 1 to encode `corpus.txt` and create the `passage_index.faiss` and `passage_store.db` in `./vector_database/.`.
+    ```shell
+    python3 save_embeddings.py \
+        --retriever_model_path <retriever model path> \
+        --build_db
+    ```
+- Step 3: Generate the Reranker Hard-Negative Dataset
+    
+    This script uses your fine-tuned retriever to mine hard negatives from the training set, creating a high-quality dataset to train the reranker.
+    ```shell
+    python3 generate_reranker_dataset.py \
+        --retriever_model_path <retriever model path> \
+        --output_file ./data/reranker_train_hard_neg.jsonl \
+        --batch_size 64
+    ```
+- Step 4: Fine-Tune the Reranker
+    
+    This script trains the cross-encoder on the new hard-negative dataset.
+    ```shell
+    python3 finetune_reranker.py \
+        --train_file ./data/reranker_train_hard_neg.jsonl \
+        --epochs 1 \
+        --batch_size 128 \
+        --eval_batch_size 128 \
+        --learning_rate 2e-5 \
+        --eval_steps 200
+    ```
+- Step 5: Run Full RAG Inference & Evaluation
+    
+    This script runs the full, end-to-end pipeline (Retriever -> Reranker -> Generate) on the test set and saves the final results and metrics.
+    ```shell
+    python3 inference_batch.py \
+        --retriever_model_path <retriever model path> \
+        --reranker_model_path <reranker model path> \
+        --test_data_path ./data/test_open.txt \
+        --result_file_name "results.json"
+    ```
+## (Optional) Run RL-based Top-M tuning
+Use **Reinforcement Learning** to train a model deciding the number of passages to include in the prompt.
+- Step 1: Collect Dataset (once)
+
+    Using your retriever and reranker and enumerates different reranker `top_m` to generate dataset.
+    ```shell
+    python rl_top-m.py \
+	    --retriever_model_path <retriever model path> \
+	    --reranker_model_path <reranker model path> \
+	    --generator_model <generator model name or path> \
+	    --scoring_model <scoring model name or path> \
+	    --rl_offline_data ./data/offline_rl_query_3000.jsonl \
+	    --mode collect \
+	    --n_queries 3000
+    ```
+- Step 2: Offline PPO Train
+
+    Using collected dataset from 'Step 1' to train PPO policy.
+    ```shell
+    python rl_top-m.py \
+	    --rl_offline_data ./data/offline_rl_query_3000.jsonl \
+	    --mode train
+    ```
+- Step 3: Online Inference
+
+    Using PPO model that trained in 'Step 2' to infer `top_m` for every query during testing.
+    ```shell
+    python inference_batch_rl.py \
+        --test_data_path ./data/test_open.txt \
+        --retriever_model_path <retriever model path> \
+        --reranker_model_path <reranker model path> \
+        --rl_model_path ./output/rl.zip
+    ```
+## 免责声明 | Disclaimer
+
+本项目仅供学习和研究使用。使用者须遵守当地的法律法规，包括但不限于 DMCA 相关法律。我们不对任何非法使用承担责任。
+
+This project is for research and learning purposes only. Users must comply with local laws and regulations, including but not limited to DMCA-related laws. We do not take any responsibility for illegal usage.
